@@ -1,0 +1,552 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="max-w-7xl mx-auto p-6 space-y-6">
+  <!-- Header / Form -->
+  <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+    <h1 class="text-2xl sm:text-3xl font-bold">SEO & Performance Dashboard</h1>
+
+    <div class="flex-1 sm:max-w-xl">
+      <form id="mainAnalyzeForm" action="/analyze" method="post" class="flex gap-2 w-full">
+        <input id="urlInput" type="url" name="url" placeholder="Enter URL (https://…)" required class="flex-1 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" value="{{ request.query_params['url'] if request and request.query_params and 'url' in request.query_params else '' }}">
+        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md">Analyze</button>
+  <svg id="analyzeSpinner" class="ml-2 w-4 h-4 animate-spin hidden" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+  </svg>
+      </form>
+<script>
+  (function () {
+    const form = document.getElementById('mainAnalyzeForm');
+    const btn = document.getElementById('analyzeBtn');
+    const text = document.getElementById('analyzeBtnText');
+    const spinner = document.getElementById('analyzeSpinner');
+    if (!form || !btn || !text || !spinner) return;
+
+    form.addEventListener('submit', function () {
+      btn.disabled = true;
+      btn.classList.add('opacity-75', 'cursor-not-allowed');
+      spinner.classList.remove('hidden');          // show the small spinner
+      text.textContent = 'Analyzing…';            // change button text
+      text.classList.add('animate-pulse');        // subtle effect on the text
+    });
+  })();
+</script>
+
+    </div>
+  </div>
+{% if result and result.amp_url %}
+  <a
+    href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
+    target="_blank"
+    class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100"
+  >
+    AMP vs Non-AMP
+  </a>
+{% endif %}
+
+  {% if result and result.is_amp and result.amp_url %}
+  <!-- AMP Controls -->
+  <div class="bg-white border rounded-lg p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <div class="flex items-center gap-2 flex-wrap">
+      <span class="text-sm text-slate-600">Variant:</span>
+      <select id="variantSelect" class="border rounded-md px-2 py-1 text-sm">
+        <option value="{{ result.url }}">Canonical</option>
+        <option value="{{ result.amp_url }}" {% if result.url == result.amp_url %}{% else %}{% endif %}>AMP</option>
+      </select>
+      <button id="loadVariantBtn" class="text-sm bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md">Load Variant</button>
+      <span class="text-slate-500 text-sm">Quick compare:</span>
+      <button id="compareAmpBtn" class="text-sm bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-md">Open AMP & Canonical</button>
+    </div>
+{% if result and result.amp_url %}
+  <a
+    href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
+    target="_blank" rel="noopener"
+    class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100"
+  >
+    AMP vs Non-AMP
+  </a>
+
+  {# Optional: prefetch to make external pages pop instantly #}
+  <link rel="prefetch" href="{{ result.url }}">
+  <link rel="prefetch" href="{{ result.amp_url }}">
+  <link rel="prefetch" href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}">
+{% endif %}
+
+    <div class="text-xs text-slate-500">Tip: use the dropdown to re-run the analysis for AMP vs non‑AMP. The compare button opens both reports in new tabs.</div>
+  </div>
+  <form id="ampFormCanonical" action="/analyze" method="post" target="_blank" class="hidden"><input type="hidden" name="url" value="{{ result.url }}"></form>
+  <form id="ampFormAmp" action="/analyze" method="post" target="_blank" class="hidden"><input type="hidden" name="url" value="{{ result.amp_url }}"></form>
+  <script>
+    (function(){
+      const sel = document.getElementById('variantSelect');
+      const btn = document.getElementById('loadVariantBtn');
+      const mainForm = document.getElementById('mainAnalyzeForm');
+      const urlInput = document.getElementById('urlInput');
+      const compareBtn = document.getElementById('compareAmpBtn');
+      const ampFormAmp = document.getElementById('ampFormAmp');
+      const ampFormCanonical = document.getElementById('ampFormCanonical');
+      if(btn){ btn.addEventListener('click', function(e){ e.preventDefault(); urlInput.value = sel.value; mainForm.submit(); }); }
+      if(compareBtn){ compareBtn.addEventListener('click', function(e){ e.preventDefault(); ampFormCanonical.submit(); ampFormAmp.submit(); }); }
+    })();
+  </script>
+  {% endif %}
+
+  {# ---------- helpers ---------- #}
+  {% macro badge(ok, text) %}
+    {% set color = 'bg-green-100 text-green-800 border-green-200' if ok is true else ('bg-yellow-100 text-yellow-800 border-yellow-200' if ok is none else 'bg-red-100 text-red-800 border-red-200') %}
+    <span class="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium {{ color }}">{{ text }}</span>
+  {% endmacro %}
+
+  {% macro pill(text, tone='slate') %}
+    <span class="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium bg-{{ tone }}-100 text-{{ tone }}-800 border-{{ tone }}-200">{{ text }}</span>
+  {% endmacro %}
+
+  {% macro krow(label, value) %}
+    <div class="flex items-center justify-between gap-3 py-1">
+      <div class="text-slate-600">{{ label }}</div>
+      <div class="text-slate-900 font-medium text-right break-all">{{ value }}</div>
+    </div>
+  {% endmacro %}
+
+  {% macro section(title, open=false) %}
+    <details class="group bg-white rounded-lg shadow border" {% if open %}open{% endif %}>
+      <summary class="cursor-pointer select-none list-none px-4 py-3 flex items-center justify-between gap-3">
+        <span class="font-semibold text-lg">{{ title }}</span>
+        <svg class="w-5 h-5 text-slate-500 group-open:rotate-180 transition-transform" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.71a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" clip-rule="evenodd"/></svg>
+      </summary>
+      <div class="px-4 pb-4 pt-1 border-t">
+        {{ caller() }}
+      </div>
+    </details>
+  {% endmacro %}
+
+  {% if result %}
+    {# normalize shapes to avoid iterating builtins #}
+    {% set open_graph = result.open_graph if result.open_graph is mapping else {} %}
+    {% set twitter = result.twitter_card if result.twitter_card is mapping else {} %}
+    {% set headings = result.headings if result.headings is mapping else {
+      'h1': (result.h1 or []),
+      'h2': (result.h2 or []),
+      'h3': (result.h3 or []),
+      'h4': (result.h4 or []),
+      'h5': (result.h5 or []),
+      'h6': (result.h6 or [])
+    } %}
+    {% set kd = result.keyword_density_top if (result.keyword_density_top is iterable and result.keyword_density_top is not string) else [] %}
+    {% set hreflang = result.hreflang if (result.hreflang is iterable and result.hreflang is not string) else [] %}
+    {% set images_missing_alt = result.images_missing_alt if (result.images_missing_alt is iterable and result.images_missing_alt is not string) else [] %}
+    {% set link_checks_internal = (result.link_checks.internal if result.link_checks and result.link_checks.internal is iterable else []) %}
+    {% set link_checks_external = (result.link_checks.external if result.link_checks and result.link_checks.external is iterable else []) %}
+    {% set sitemaps = (result.crawl_checks.sitemaps if result.crawl_checks and result.crawl_checks.sitemaps is iterable else []) %}
+    {% set ps_mobile_metrics = (result.pagespeed.mobile.metrics if result.pagespeed and result.pagespeed.mobile and result.pagespeed.mobile.metrics is mapping else {}) %}
+    {% set ps_desktop_metrics = (result.pagespeed.desktop.metrics if result.pagespeed and result.pagespeed.desktop and result.pagespeed.desktop.metrics is mapping else {}) %}
+    {% set rendered_matrix = (result.rendered_diff.matrix if result.rendered_diff and result.rendered_diff.matrix is iterable else []) %}
+
+    {# ---------- topline cards ---------- #}
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div class="bg-white rounded-lg shadow border p-4">
+        <div class="text-slate-500 text-sm">Status</div>
+        <div class="text-2xl font-semibold">{{ result.status_code }}</div>
+        <div class="mt-2">{{ badge(result.status_code in [200, 201, 204], 'HTTP ' ~ result.status_code) }}</div>
+      </div>
+      <div class="bg-white rounded-lg shadow border p-4">
+        <div class="text-slate-500 text-sm">Load Time</div>
+        <div class="text-2xl font-semibold">{{ result.load_time_ms }} ms</div>
+        <div class="mt-2">{{ badge(result.load_time_ms and result.load_time_ms <= 2500, (result.load_time_ms or 0) ~ ' ms') }}</div>
+      </div>
+      <div class="bg-white rounded-lg shadow border p-4">
+        <div class="text-slate-500 text-sm">Page Size</div>
+        <div class="text-2xl font-semibold">{{ result.content_length }} B</div>
+      </div>
+      <div class="bg-white rounded-lg shadow border p-4">
+        <div class="text-slate-500 text-sm">Protocol</div>
+        <div class="text-2xl font-semibold">{{ 'HTTPS' if (result.performance.https.is_https if result.performance else (result.url.startswith('https'))) else 'HTTP' }}</div>
+        <div class="mt-2 flex flex-wrap gap-2">
+          {{ badge(result.is_amp, 'AMP') }}
+          {% if result.amp_url %}{{ pill('AMP URL set','blue') }}{% endif %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="flex flex-wrap items-center gap-2">
+      <a href="{{ result.url }}" target="_blank" class="inline-flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-md hover:bg-slate-900">
+        <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M12.293 2.293a1 1 0 011.414 0l4 4a1 1 0 01-1.414 1.414L14 5.414V13a1 1 0 11-2 0V5.414L9.707 7.707A1 1 0 018.293 6.293l4-4z"/><path d="M3 9a1 1 0 011-1h3a1 1 0 110 2H5v6h10v-2a1 1 0 112 0v3a1 1 0 01-1 1H4a1 1 0 01-1-1V9z"/></svg>
+        Open Page
+      </a>
+      <button onclick="window.print()" class="inline-flex items-center gap-2 bg-white border px-3 py-2 rounded-md hover:bg-slate-50">
+        <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M6 2a2 2 0 00-2 2v2h12V4a2 2 0 00-2-2H6z"/><path d="M4 8a2 2 0 00-2 2v3h4v3h8v-3h4v-3a2 2 0 01-2-2H4zm3 5h6v2H7v-2z"/></svg>
+        Download as PDF
+      </button>
+    </div>
+
+    <!-- Page Overview -->
+    {% call section('Page Overview', true) %}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          {{ krow('URL', result.url) }}
+          {{ krow('Final URL', result.performance.final_url if result.performance else result.url) }}
+          {{ krow('HTTP Version', result.performance.http_version if result.performance else '—') }}
+          {{ krow('Redirects', result.performance.redirects if result.performance else '—') }}
+          {{ krow('AMP URL', result.amp_url or '—') }}
+        </div>
+        <div class="space-y-2">
+          <div>HTTPS: {{ badge(result.performance.https.is_https if result.performance else result.url.startswith('https'), ("On" if (result.performance.https.is_https if result.performance else result.url.startswith('https')) else "Off")) }}</div>
+          <div class="flex flex-wrap gap-2">
+            {{ badge(result.checks.canonical.ok if result.checks else none, 'Canonical') }}
+            {{ badge(result.checks.viewport_meta.ok if result.checks else none, 'Viewport') }}
+            {{ badge(result.checks.h1_count.ok if result.checks else none, 'H1 Count') }}
+            {{ badge(result.checks.alt_coverage.ok if result.checks else none, 'Alt Coverage') }}
+            {{ badge(result.checks.indexable.ok if result.checks else none, 'Indexable') }}
+          </div>
+        </div>
+      </div>
+    {% endcall %}
+
+    <!-- SEO Meta -->
+    {% call section('SEO Meta', true) %}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="space-y-2">
+          {{ krow('Title', result.title or '—') }}
+          {{ krow('Meta Description', result.description or '—') }}
+          {{ krow('Canonical', result.canonical or '—') }}
+          {{ krow('Robots Meta', result.robots_meta or '—') }}
+          {{ krow('Favicon', open_graph.get('og:image', '—')) }}
+        </div>
+        <div class="space-y-2">
+          {{ krow('Viewport Meta', (result.checks.viewport_meta.value if result.checks else '—')) }}
+          <div class="flex flex-wrap gap-2">
+            {{ badge(result.has_open_graph, 'Open Graph') }}
+            {{ badge(result.has_twitter_card, 'Twitter Card') }}
+            {{ badge(result.checks.title_length.ok if result.checks else none, 'Title Length: ' ~ (result.checks.title_length.chars if result.checks else '—')) }}
+            {{ badge(result.checks.meta_description_length.ok if result.checks else none, 'Description Length: ' ~ (result.checks.meta_description_length.chars if result.checks else '—')) }}
+          </div>
+          <div class="mt-2">
+            <div class="text-sm text-slate-500 mb-1">OG Tags</div>
+            <div class="flex flex-wrap gap-2">
+              {% for k,v in open_graph.items() %}{{ pill(k ~ ': ' ~ (v or '')) }}{% else %}<span class="text-slate-400">None</span>{% endfor %}
+            </div>
+          </div>
+          <div class="mt-2">
+            <div class="text-sm text-slate-500 mb-1">Twitter Card</div>
+            <div class="flex flex-wrap gap-2">
+              {% for k,v in twitter.items() %}{{ pill(k ~ ': ' ~ (v or ''), 'blue') }}{% else %}<span class="text-slate-400">None</span>{% endfor %}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {% if hreflang and hreflang|length %}
+        <div class="mt-4">
+          <div class="text-sm text-slate-500 mb-2">Hreflang</div>
+          <div class="flex flex-wrap gap-2">
+            {% for row in hreflang %}{{ pill((row.hreflang or row.get('hreflang','')) ~ ' → ' ~ (row.href or row.get('href','')), 'violet') }}{% endfor %}
+          </div>
+        </div>
+      {% endif %}
+    {% endcall %}
+
+    <!-- Content Structure -->
+    {% call section('Content Structure', true) %}
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-50 rounded-md p-4 border">
+          <div class="font-semibold mb-3">Headings (H1–H6)</div>
+          {% for hlevel in ['h1','h2','h3','h4','h5','h6'] %}
+            {% set arr = (headings.get(hlevel) if headings else []) %}
+            <details class="mb-2" {% if hlevel in ['h1','h2'] %}open{% endif %}>
+              <summary class="cursor-pointer text-sm font-medium">{{ hlevel|upper }} ({{ (arr or [])|length }})</summary>
+              <ul class="mt-2 space-y-1 list-disc list-inside">
+                {% for h in (arr or []) %}<li class="break-words">{{ h }}</li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
+              </ul>
+            </details>
+          {% endfor %}
+        </div>
+        <div class="bg-slate-50 rounded-md p-4 border">
+          <div class="font-semibold mb-3">Keyword Density (top 10)</div>
+          <div class="overflow-x-auto">
+            <table class="min-w-full text-sm">
+              <thead class="text-left text-slate-500">
+                <tr><th class="py-1 pr-3">Word</th><th class="py-1 pr-3">Count</th><th class="py-1">%</th></tr>
+              </thead>
+              <tbody>
+                {% for row in kd %}
+                  <tr class="border-t"><td class="py-1 pr-3 font-medium">{{ row.word }}</td><td class="py-1 pr-3">{{ row.count }}</td><td class="py-1">{{ row.percent }}%</td></tr>
+                {% else %}
+                  <tr><td colspan="3" class="py-2 text-slate-400">No text detected</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    {% endcall %}
+
+    <!-- Links -->
+    {% call section('Links', false) %}
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div>
+          <div class="font-semibold mb-2">Internal ({{ (result.internal_links or [])|length }})</div>
+          <details>
+            <summary class="cursor-pointer text-sm">Show list</summary>
+            <ul class="mt-2 space-y-1 list-disc list-inside">
+              {% for u in (result.internal_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+            </ul>
+          </details>
+        </div>
+        <div>
+          <div class="font-semibold mb-2">External ({{ (result.external_links or [])|length }})</div>
+          <details>
+            <summary class="cursor-pointer text-sm">Show list</summary>
+            <ul class="mt-2 space-y-1 list-disc list-inside">
+              {% for u in (result.external_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+            </ul>
+          </details>
+        </div>
+        <div>
+          <div class="font-semibold mb-2">Nofollow ({{ (result.nofollow_links or [])|length }})</div>
+          <details>
+            <summary class="cursor-pointer text-sm">Show list</summary>
+            <ul class="mt-2 space-y-1 list-disc list-inside">
+              {% for u in (result.nofollow_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+            </ul>
+          </details>
+        </div>
+      </div>
+
+      {% if result.link_checks %}
+        <div class="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div class="bg-white border rounded-md p-4">
+            <div class="font-semibold mb-2">Internal Link Status (sample)</div>
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">URL</th><th class="py-1 pr-3">Status</th><th class="py-1">Redirects</th></tr></thead>
+                <tbody>
+                  {% for row in link_checks_internal %}
+                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
+                  {% else %}
+                    <tr><td colspan="3" class="py-2 text-slate-400">No sample</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="bg-white border rounded-md p-4">
+            <div class="font-semibold mb-2">External Link Status (sample)</div>
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">URL</th><th class="py-1 pr-3">Status</th><th class="py-1">Redirects</th></tr></thead>
+                <tbody>
+                  {% for row in link_checks_external %}
+                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
+                  {% else %}
+                    <tr><td colspan="3" class="py-2 text-slate-400">No sample</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      {% endif %}
+    {% endcall %}
+
+    <!-- Media -->
+    {% call section('Media (Images)', false) %}
+      <div class="flex flex-wrap gap-2 mb-3">
+        {{ badge((result.checks.alt_coverage.ok if result.checks else none), 'Alt Coverage ' ~ (result.checks.alt_coverage.percent ~ '%' if result.checks else '')) }}
+        {{ pill('Total images: ' ~ (result.checks.alt_coverage.total_imgs if result.checks else 0), 'slate') }}
+      </div>
+      <details>
+        <summary class="cursor-pointer text-sm font-medium">Images missing alt ({{ images_missing_alt|length }})</summary>
+        <ul class="mt-2 space-y-1 list-disc list-inside">
+          {% for im in images_missing_alt %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ im.src }}" target="_blank">{{ im.src }}</a></li>{% else %}<li class="text-slate-400">None 🎉</li>{% endfor %}
+        </ul>
+      </details>
+    {% endcall %}
+
+    <!-- Structured Data -->
+    {% call section('Structured Data', false) %}
+      <div class="flex flex-wrap gap-2 mb-4">
+        {{ pill('JSON-LD: ' ~ ((result.json_ld or [])|length), 'emerald') }}
+        {{ pill('Microdata: ' ~ ((result.microdata or [])|length), 'cyan') }}
+        {{ pill('RDFa: ' ~ ((result.rdfa or [])|length), 'amber') }}
+        {% if result.sd_types and result.sd_types.types %}
+          <div class="w-full"></div>
+          <div class="text-sm text-slate-500">Types detected:</div>
+          <div class="flex flex-wrap gap-2">
+            {% for t in result.sd_types.types %}{{ pill(t, 'violet') }}{% else %}<span class="text-slate-400">None</span>{% endfor %}
+          </div>
+        {% endif %}
+      </div>
+
+      {% if result.json_ld_validation %}
+        <div class="bg-white border rounded-md p-4">
+          <div class="font-semibold mb-2">JSON-LD Validation</div>
+          <div class="text-sm text-slate-600 mb-2">Items OK: {{ result.json_ld_validation.summary.ok_count }}/{{ result.json_ld_validation.summary.total_items }} {% if result.json_ld_validation.summary.has_errors %}{{ badge(false, 'Has missing required fields') }}{% else %}{{ badge(true, 'All good') }}{% endif %}</div>
+          <details>
+            <summary class="cursor-pointer text-sm">Show details</summary>
+            <div class="mt-2 overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">Type</th><th class="py-1 pr-3">Missing</th><th class="py-1">State</th></tr></thead>
+                <tbody>
+                  {% set jsonld_items = (result.json_ld_validation.items if result.json_ld_validation.items is iterable else []) %}
+                  {% for it in jsonld_items %}
+                    <tr class="border-t"><td class="py-1 pr-3">{{ it.type or 'Unknown' }}</td><td class="py-1 pr-3">{{ (it.missing or [])|join(', ') or '—' }}</td><td class="py-1">{{ badge(it.ok, it.ok and 'OK' or 'Check') }}</td></tr>
+                  {% else %}
+                    <tr><td colspan="3" class="py-2 text-slate-400">No items</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      {% endif %}
+    {% endcall %}
+
+    <!-- Indexing & Crawling -->
+    {% call section('Indexing & Crawling', false) %}
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-white border rounded-md p-4">
+          <div class="font-semibold mb-2">Robots & Sitemaps</div>
+          <div class="space-y-1">
+            {{ krow('robots.txt', result.robots_url or '—') }}
+            {% if result.crawl_checks %}
+              {{ krow('Blocked by robots for this UA', result.crawl_checks.blocked_by_robots if result.crawl_checks.blocked_by_robots is not none else 'Unknown') }}
+              <div class="text-sm text-slate-500 mt-3">Sitemaps discovered (from robots.txt)</div>
+              <ul class="mt-1 space-y-1 list-disc list-inside">
+                {% for sm in sitemaps %}
+                  <li class="break-all">{{ sm.url }} {% if sm.status %}<span class="text-slate-500">(status {{ sm.status }})</span>{% elif sm.note %}<span class="text-slate-500">({{ sm.note }})</span>{% elif sm.error %}<span class="text-red-600">({{ sm.error }})</span>{% endif %}</li>
+                {% else %}<li class="text-slate-400">None</li>{% endfor %}
+              </ul>
+              {% if result.sitemap_summary %}
+                <div class="mt-3 text-sm text-slate-600">Sitemap sample URL tags: {{ result.sitemap_summary.total_url_count_sampled }}</div>
+              {% endif %}
+            {% endif %}
+          </div>
+        </div>
+        <div class="bg-white border rounded-md p-4">
+          <div class="font-semibold mb-2">Indexability Flags</div>
+          <div class="flex flex-wrap gap-2">
+            {{ badge(result.checks.indexable.ok if result.checks else none, 'Indexable: ' ~ (result.checks.indexable.value if result.checks else '—')) }}
+            {{ badge(result.checks.robots_meta_index.ok if result.checks else none, 'Robots meta index: ' ~ (result.checks.robots_meta_index.value if result.checks else '—')) }}
+            {{ badge(result.checks.robots_meta_follow.ok if result.checks else none, 'Follow: ' ~ (result.checks.robots_meta_follow.value if result.checks else '—')) }}
+            {{ badge(result.checks.x_robots_tag.ok if result.checks else none, 'X-Robots-Tag') }}
+            {{ badge(result.checks.lang.ok if result.checks else none, 'Lang attr') }}
+            {{ badge(result.checks.charset.ok if result.checks else none, 'Charset') }}
+            {{ badge(result.checks.compression.ok if result.checks else none, 'Compression: ' ~ (result.checks.compression.value if result.checks else '—')) }}
+          </div>
+        </div>
+      </div>
+    {% endcall %}
+
+    <!-- Performance -->
+    {% call section('Performance', false) %}
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="bg-white border rounded-md p-4">
+          <div class="font-semibold mb-2">Network Snapshot</div>
+          {{ krow('Load time (ms)', result.performance.load_time_ms if result.performance else result.load_time_ms) }}
+          {{ krow('Page size (bytes)', result.performance.page_size_bytes if result.performance else result.content_length) }}
+          {{ krow('HTTP version', result.performance.http_version if result.performance else '—') }}
+          {{ krow('Redirects', result.performance.redirects if result.performance else '—') }}
+        </div>
+        <div class="bg-white border rounded-md p-4">
+          <div class="font-semibold mb-2">PageSpeed (if enabled)</div>
+          {% if result.pagespeed and result.pagespeed.enabled %}
+            <div class="flex flex-wrap gap-2 mb-2">
+              {{ badge(result.performance.mobile_score is not none, 'Mobile: ' ~ (result.performance.mobile_score or '—')) }}
+              {{ badge(result.performance.desktop_score is not none, 'Desktop: ' ~ (result.performance.desktop_score or '—')) }}
+            </div>
+            <details class="mb-2" open>
+              <summary class="cursor-pointer text-sm font-medium">Mobile metrics</summary>
+              <ul class="mt-2 text-sm space-y-1">
+                {% for k,v in ps_mobile_metrics.items() %}<li class="flex justify-between"><span class="text-slate-600">{{ k }}</span><span class="font-medium">{{ v }}</span></li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
+              </ul>
+            </details>
+            <details>
+              <summary class="cursor-pointer text-sm font-medium">Desktop metrics</summary>
+              <ul class="mt-2 text-sm space-y-1">
+                {% for k,v in ps_desktop_metrics.items() %}<li class="flex justify-between"><span class="text-slate-600">{{ k }}</span><span class="font-medium">{{ v }}</span></li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
+              </ul>
+            </details>
+          {% else %}
+            <div class="text-sm text-slate-500">
+              Pagespeed API not enabled.
+              {% if result.pagespeed and result.pagespeed.message %}
+                <div class="mt-1">{{ result.pagespeed.message }}</div>
+              {% endif %}
+              <ul class="list-disc list-inside mt-2 text-slate-500">
+                <li>Set a PageSpeed API key on the server (e.g., <code>GOOGLE_PSI_API_KEY</code>).</li>
+                <li>Enable the feature in your config and re-run analysis.</li>
+              </ul>
+            </div>
+          {% endif %}
+        </div>
+        <div class="bg-white border rounded-md p-4">
+          <div class="font-semibold mb-2">Security</div>
+          {{ krow('HTTPS', (result.performance.https.is_https if result.performance else result.url.startswith('https')) and 'Yes' or 'No') }}
+          {{ krow('SSL checked', (result.performance.https.ssl_checked if result.performance else false) and 'Yes' or 'No') }}
+          {{ krow('SSL OK', result.performance.https.ssl_ok if result.performance else '—') }}
+        </div>
+      </div>
+    {% endcall %}
+
+    <!-- Rendered vs Static Comparison -->
+    {% call section('Rendered vs Static Comparison', false) %}
+      {% if rendered_matrix %}
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead class="text-left text-slate-500">
+              <tr><th class="py-1 pr-3">Metric</th><th class="py-1 pr-3">Static</th><th class="py-1 pr-3">Rendered</th><th class="py-1">Changed?</th></tr>
+            </thead>
+            <tbody>
+              {% for row in rendered_matrix %}
+                <tr class="border-t">
+                  <td class="py-1 pr-3">{{ row.label }}</td>
+                  <td class="py-1 pr-3 break-all">{{ row.before }}</td>
+                  <td class="py-1 pr-3 break-all">{{ row.after }}</td>
+                  <td class="py-1">{{ badge(not not row.changed, row.changed and 'Yes' or 'No') }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="text-sm text-slate-500">Rendered DOM check skipped or failed.
+        {% set err = (result.rendered_diff.error if result.rendered_diff and result.rendered_diff.error else '') %}
+        <div class="mt-2 text-xs text-slate-600">Possible reasons: Playwright/Chromium not installed, sandbox blocked, timeout, or CSP blocking resources.</div>
+        {% if err %}<div class="text-xs text-red-600 mt-1">{{ err }}</div>{% endif %}
+        <ul class="list-disc list-inside mt-2 text-xs text-slate-600">
+          {% set hints = [
+            'Install Playwright browsers on the server (e.g., playwright install --with-deps chromium).',
+            'Ensure headless Chromium can run (fonts, libc, shared libs).',
+            'Increase render timeout if your server supports it.'
+          ] %}
+          {% for h in hints %}
+            {% if not err or (h not in err) %}<li>{{ h }}</li>{% endif %}
+          {% endfor %}
+        </ul>
+        {% if err and 'Playwright render skipped/failed' in err %}
+          {# avoid repeating the same line; already shown above #}
+        {% endif %}
+        <ul class="list-disc list-inside mt-2 text-xs text-slate-600">
+          <li>Install Playwright browsers on the server (e.g., <code>playwright install --with-deps chromium</code>).</li>
+          <li>Ensure headless Chromium can run (fonts, libc, shared libs).</li>
+          <li>Increase render timeout if your server supports it.</li>
+        </ul></div>
+        {% if result.rendered_diff and result.rendered_diff.error %}<div class="text-sm text-red-600 mt-2">{{ result.rendered_diff.error }}</div>{% endif %}
+      {% endif %}
+    {% endcall %}
+
+    <!-- Raw Data (for debugging / export) -->
+    {% call section('Raw Result (JSON)', false) %}
+      <pre class="text-xs bg-slate-900 text-slate-100 rounded-md p-4 overflow-x-auto">{{ result|tojson(indent=2) }}</pre>
+    {% endcall %}
+
+  {% else %}
+    <div class="bg-white border rounded-lg p-6 text-slate-600">
+      Paste a URL above and hit Analyze to see a full SEO & performance report. The dashboard will include Page Overview, SEO Meta, Content Structure, Links, Media, Structured Data, Indexing & Crawling, Performance metrics, and a Rendered vs Static comparison. Use the “Download as PDF” button to save client-ready reports.
+    </div>
+  {% endif %}
+</div>
+
+{% endblock %}

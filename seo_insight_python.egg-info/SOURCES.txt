@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+app/change_detector.py
+app/db.py
+app/emailing.py
+app/main.py
+app/models.py
+app/seo.py
+seo_insight_python.egg-info/PKG-INFO
+seo_insight_python.egg-info/SOURCES.txt
+seo_insight_python.egg-info/dependency_links.txt
+seo_insight_python.egg-info/requires.txt
+seo_insight_python.egg-info/top_level.txt

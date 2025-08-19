@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title or "SEO Insight (Python)" }}</title>
+
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: {
+      boxShadow: { soft: "0 8px 24px rgba(0,0,0,.08)" }
+    }}}
+  </script>
+  <style>
+    .code { white-space: pre-wrap; word-wrap: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+    .badge { display:inline-block; padding:.2rem .5rem; border-radius:.5rem; font-size:.75rem; border:1px solid #e5e7eb; background:#f8fafc;}
+    .clip { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .break-any { word-break: break-word; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body class="h-full bg-slate-50 text-slate-900">
+  <header class="sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-slate-200">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-4">
+      <div class="text-xl font-semibold">SEO Insight <span class="text-slate-400">/ Python</span></div>
+      <nav class="ml-auto flex items-center gap-2">
+        <a href="/" class="px-3 py-1.5 rounded-lg hover:bg-slate-100">Home</a>
+        <a href="/scheduled" class="px-3 py-1.5 rounded-lg hover:bg-slate-100">Scheduled Scans</a>
+        <a href="/export" class="px-3 py-1.5 rounded-lg hover:bg-slate-100">Export CSV</a>
+      </nav>
+    </div>
+  </header>
+  <main class="max-w-6xl mx-auto p-4">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="max-w-6xl mx-auto p-4 text-sm text-slate-500">
+    <div>Local only • For testing/analysis</div>
+  </footer>
+</body>
+</html>

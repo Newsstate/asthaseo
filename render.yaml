@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: seo-insight
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: TZ
+        value: Asia/Kolkata
+      - key: DATABASE_URL
+        value: sqlite:////var/data/seo_insight.db
+      - key: SMTP_SERVER
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: FROM_EMAIL
+        sync: false
+      - key: PAGESPEED_API_KEY
+        sync: false
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1

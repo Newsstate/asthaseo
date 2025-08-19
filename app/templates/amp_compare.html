@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="max-w-5xl mx-auto bg-white rounded-2xl shadow-soft p-6">
+  <div class="flex items-start justify-between gap-3 flex-wrap">
+    <h1 class="text-xl font-semibold">AMP vs Non-AMP Comparison</h1>
+    <div class="flex gap-2">
+      {% if url %}
+        <a href="{{ url }}" target="_blank" class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">Open Non-AMP</a>
+      {% endif %}
+      {% if amp_url %}
+        <a href="{{ amp_url }}" target="_blank" class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">Open AMP</a>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if error %}
+    <div class="mt-4 text-red-600 text-sm">{{ error }}</div>
+  {% else %}
+    <div class="mt-4 overflow-x-auto">
+      <table class="w-full text-sm border border-slate-200 rounded-xl overflow-hidden">
+        <thead class="bg-slate-50">
+          <tr>
+            <th class="text-left px-3 py-2">Metric</th>
+            <th class="text-left px-3 py-2">Non-AMP</th>
+            <th class="text-left px-3 py-2">AMP</th>
+            <th class="text-left px-3 py-2">Changed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+            <tr class="border-t">
+              <td class="px-3 py-2 text-slate-600">{{ r.label }}</td>
+              <td class="px-3 py-2 break-any">{{ r.non_amp }}</td>
+              <td class="px-3 py-2 break-any">{{ r.amp }}</td>
+              <td class="px-3 py-2">
+                <span class="badge" style="background: {{ '#fef2f2' if r.changed else '#ecfdf5' }}; border-color: {{ '#ef444433' if r.changed else '#10b98133' }};">
+                  {{ 'Changed' if r.changed else 'Same' }}
+                </span>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  <div class="mt-6">
+    <a href="/" class="text-blue-600 hover:underline">← Back to Analyzer</a>
+  </div>
+</section>
+
+{% endblock %}

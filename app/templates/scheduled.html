@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="bg-white rounded-2xl shadow-soft p-5">
+  <h2 class="text-lg font-semibold">Scheduled Scans</h2>
+  <p class="text-slate-500 text-sm mb-4">Run daily or weekly and optionally send an email when changes are detected.</p>
+
+  <form action="/scheduled" method="post" class="grid md:grid-cols-4 gap-3 items-end">
+    <div class="md:col-span-2">
+      <label class="text-sm text-slate-600">URL</label>
+      <input type="url" name="url" class="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="https://example.com" required />
+    </div>
+    <div>
+      <label class="text-sm text-slate-600">Email (optional)</label>
+      <input type="email" name="user_email" class="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="you@example.com" />
+    </div>
+    <div class="flex gap-2">
+      <div class="flex-1">
+        <label class="text-sm text-slate-600">Frequency</label>
+        <select name="frequency" class="w-full rounded-xl border border-slate-300 px-3 py-2">
+          <option value="daily">Daily (09:00)</option>
+          <option value="weekly">Weekly (Mon 09:00)</option>
+        </select>
+      </div>
+      <button class="self-end bg-slate-900 text-white px-4 py-2 rounded-xl hover:bg-slate-800">Add</button>
+    </div>
+  </form>
+</section>
+
+<section class="mt-6 bg-white rounded-2xl shadow-soft p-5">
+  <h3 class="text-lg font-semibold mb-3">Existing</h3>
+  <div class="overflow-auto">
+    <table class="min-w-full text-sm">
+      <thead>
+        <tr class="text-left text-slate-500">
+          <th class="py-2">ID</th>
+          <th class="py-2">URL</th>
+          <th class="py-2">Email</th>
+          <th class="py-2">Frequency</th>
+          <th class="py-2">Last Run</th>
+          <th class="py-2"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y">
+      {% for s in scans %}
+        <tr>
+          <td class="py-2">{{ s.id }}</td>
+          <td class="py-2"><a class="text-blue-600 hover:underline break-all" href="{{ s.url }}" target="_blank">{{ s.url }}</a></td>
+          <td class="py-2">{{ s.user_email or "" }}</td>
+          <td class="py-2">{{ s.frequency }}</td>
+          <td class="py-2">{{ s.last_run_at or "" }}</td>
+          <td class="py-2">
+            <form action="/scheduled/{{ s.id }}/delete" method="post">
+              <button class="px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-100">Delete</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td class="py-4 text-slate-500" colspan="6">No scheduled scans yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "seo-insight-python"
+version = "0.1.0"
+description = "Local SEO analyzer (FastAPI) inspired by SeoInsight"
+authors = [{name="You"}]
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "httpx>=0.27.0",
+  "beautifulsoup4>=4.12.2",
+  "lxml>=5.2.2",
+  "tldextract>=5.1.2",
+  "sqlmodel>=0.0.22",
+  "apscheduler>=3.10.4",
+  "python-multipart>=0.0.9",
+  "jinja2>=3.1.4",
+]
