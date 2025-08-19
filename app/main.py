@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Request, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -77,7 +77,7 @@ def _normalize_url(u: str) -> str:
     return u
 
 # ---------- Routes ----------
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, name="home")
 async def index(request: Request):
     # Render the main dashboard with empty result
     return templates.TemplateResponse("index.html", {"request": request, "result": None})
@@ -138,33 +138,107 @@ async def analyze_api(payload: AnalyzeRequest):
     data = await run_in_threadpool(get_pagespeed_data, target)
     return {"url": target, "result": data}
 
-# AMP Compare helper (optional)
-@app.get("/amp-compare", name="amp_compare", response_class=HTMLResponse)
-async def amp_compare(request: Request, url: str):
-    try:
-        data = await run_in_threadpool(get_pagespeed_data, _normalize_url(url))
-        amp_url = (data or {}).get("amp_url")
-    except Exception:
-        amp_url = None
+# --- AMP vs Non-AMP compare page (renders app/templates/amp_compare.html) ---
+@app.get("/amp-compare", response_class=HTMLResponse, name="amp_compare")
+async def amp_compare(request: Request, url: str = Query(...)):
+    """
+    Compare key SEO/performance/meta items between a canonical URL and its AMP variant.
+    """
+    def fmt(v):
+        if v is None:
+            return "—"
+        if isinstance(v, (list, tuple)):
+            return " | ".join([str(x) for x in v[:5]])
+        return str(v)
 
-    body = f"""
-    <!doctype html>
-    <html><head><meta charset="utf-8"><title>AMP Compare</title></head>
-    <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 16px;">
-      <h1 style="margin: 0 0 12px;">AMP vs Canonical</h1>
-      <p>Opening pages in new tabs… If nothing opened, use the links below.</p>
-      <ul>
-        <li><a href="{url}" target="_blank" rel="noopener">Canonical</a></li>
-        {("<li><a href='" + amp_url + "' target='_blank' rel='noopener'>AMP</a></li>") if amp_url else ""}
-      </ul>
-      <script>
-        try {{
-          window.open("{url}", "_blank");
-          {"window.open('" + amp_url + "', '_blank');" if amp_url else ""}
-        }} catch (e) {{}}
-      </script>
-    </body></html>"""
-    return HTMLResponse(content=body)
+    def sget(d, *keys, default=None):
+        cur = d
+        for k in keys:
+            if cur is None:
+                return default
+            if isinstance(cur, dict):
+                cur = cur.get(k)
+            else:
+                return default
+        return cur if cur is not None else default
+
+    # Fetch the initial URL (fast mode)
+    try:
+        a = await run_in_threadpool(get_pagespeed_data, _normalize_url(url), True)
+    except Exception as e:
+        return templates.TemplateResponse(
+            "amp_compare.html",
+            {"request": request, "url": url, "amp_url": None, "rows": [], "error": f"Fetch failed: {e}"}
+        )
+
+    # Decide roles
+    non_amp_url = _normalize_url(url)
+    amp_url = a.get("amp_url")
+
+    if a.get("is_amp"):
+        # Input is AMP: use its canonical as Non-AMP, and keep the input as AMP
+        amp_url = non_amp_url  # <- this was the input URL
+        non_amp_url = a.get("canonical") or non_amp_url
+
+    if not amp_url:
+        return templates.TemplateResponse(
+            "amp_compare.html",
+            {"request": request, "url": non_amp_url, "amp_url": None, "rows": [], "error": "No AMP version found (no <link rel=\"amphtml\">)."}
+        )
+
+    # Fetch AMP page
+    try:
+        b = await run_in_threadpool(get_pagespeed_data, _normalize_url(amp_url), True)
+    except Exception as e:
+        return templates.TemplateResponse(
+            "amp_compare.html",
+            {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": [], "error": f"AMP fetch failed: {e}"}
+        )
+
+    # Build comparison rows
+    rows = []
+    def add_row(label, val_a, val_b):
+        sa, sb = fmt(val_a), fmt(val_b)
+        rows.append({"label": label, "non_amp": sa, "amp": sb, "changed": (sa != sb)})
+
+    add_row("HTTP Status", a.get("status_code"), b.get("status_code"))
+    add_row("Title", a.get("title"), b.get("title"))
+    add_row("Meta Description", a.get("description"), b.get("description"))
+    add_row("Canonical", a.get("canonical"), b.get("canonical"))
+    add_row("Robots Meta", a.get("robots_meta"), b.get("robots_meta"))
+    add_row("H1", sget(a, "h1", default=[]), sget(b, "h1", default=[]))
+
+    # Performance
+    add_row("Load Time (ms)",
+            sget(a, "performance", "load_time_ms", default=a.get("load_time_ms")),
+            sget(b, "performance", "load_time_ms", default=b.get("load_time_ms")))
+    add_row("Page Size (bytes)",
+            sget(a, "performance", "page_size_bytes", default=a.get("content_length")),
+            sget(b, "performance", "page_size_bytes", default=b.get("content_length")))
+    add_row("PSI Mobile Score",
+            sget(a, "performance", "mobile_score"),
+            sget(b, "performance", "mobile_score"))
+    add_row("PSI Desktop Score",
+            sget(a, "performance", "desktop_score"),
+            sget(b, "performance", "desktop_score"))
+
+    # Social meta
+    add_row("OG Image",
+            sget(a, "open_graph", "og:image"),
+            sget(b, "open_graph", "og:image"))
+    add_row("Twitter Card",
+            sget(a, "twitter_card", "twitter:card"),
+            sget(b, "twitter_card", "twitter:card"))
+
+    # Indexability
+    add_row("Indexable",
+            sget(a, "checks", "indexable", "value"),
+            sget(b, "checks", "indexable", "value"))
+
+    return templates.TemplateResponse(
+        "amp_compare.html",
+        {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": rows, "error": None}
+    )
 
 @app.get("/healthz", response_class=JSONResponse)
 async def healthz():
