@@ -466,14 +466,14 @@
           {{ krow('HTTPS', (result.performance.https.is_https if result.performance else result.url.startswith('https')) and 'Yes' or 'No') }}
           <div class="mt-3 text-sm">
             <div class="font-medium mb-1">Security Headers (score {{ (security_headers.score_6 or 0) if security_headers else 0 }}/6)</div>
-            <div class="flex flex-wrap gap-2">
-              {{ badge(security_headers.hsts, 'HSTS') }}
-              {{ badge(security_headers.csp, 'CSP') }}
-              {{ badge(security_headers.xcto == 'nosniff' if security_headers else none, 'X-Content-Type-Options') }}
-              {{ badge(security_headers.xfo in ['DENY','SAMEORIGIN'] if security_headers else none, 'X-Frame-Options') }}
-              {{ badge(security_headers.referrer_policy, 'Referrer-Policy') }}
-              {{ badge(security_headers.permissions_policy, 'Permissions-Policy') }}
-            </div>
+           <div class="flex flex-wrap gap-2">
+  {{ badge(security_headers.hsts is not none, 'HSTS') }}
+  {{ badge(security_headers.csp is not none, 'CSP') }}
+  {{ badge(security_headers.xcto == 'nosniff' if security_headers else none, 'X-Content-Type-Options') }}
+  {{ badge(security_headers.xfo in ['DENY','SAMEORIGIN'] if security_headers else none, 'X-Frame-Options') }}
+  {{ badge(security_headers.referrer_policy is not none, 'Referrer-Policy') }}
+  {{ badge(security_headers.permissions_policy is not none, 'Permissions-Policy') }}
+</div>
           </div>
         </div>
       </div>
@@ -509,24 +509,28 @@
     {% endcall %}
 
     <!-- Mixed Content -->
-    {% call section('Mixed Content (HTTPS)', false) %}
-      <div class="flex items-center gap-2">
-        {{ badge(mixed_content.affected == 0, (mixed_content.affected == 0) and 'No mixed content' or (mixed_content.affected ~ ' insecure assets')) }}
-      </div>
-      {% if mixed_content.items and (mixed_content.items|length) %}
-        <details class="mt-2">
-          <summary class="cursor-pointer text-sm">Show insecure asset URLs</summary>
-          <ul class="mt-2 list-disc list-inside text-sm space-y-1">
-            {% for u in mixed_content.items %}<li class="break-all"><a href="{{ u }}" class="text-blue-700 hover:underline" target="_blank">{{ u }}</a></li>{% endfor %}
-          </ul>
-        </details>
-      {% endif %}
-    {% endcall %}
+   {% call section('Mixed Content (HTTPS)', false) %}
+  {% set mc_items = mixed_content['items'] if mixed_content and ('items' in mixed_content) else [] %}
+  {% set mc_affected = mixed_content['affected'] if mixed_content and ('affected' in mixed_content) else 0 %}
 
-    <!-- Raw Data (for debugging / export) -->
-    {% call section('Raw Result (JSON)', false) %}
-      <pre class="text-xs bg-slate-900 text-slate-100 rounded-md p-4 overflow-x-auto">{{ result|tojson(indent=2) }}</pre>
-    {% endcall %}
+  <div class="flex items-center gap-2">
+    {{ badge(mc_affected == 0, (mc_affected == 0) and 'No mixed content' or (mc_affected ~ ' insecure assets')) }}
+  </div>
+
+  {% if mc_items and (mc_items|length) %}
+    <details class="mt-2">
+      <summary class="cursor-pointer text-sm">Show insecure asset URLs</summary>
+      <ul class="mt-2 list-disc list-inside text-sm space-y-1">
+        {% for u in mc_items %}
+          <li class="break-all">
+            <a href="{{ u }}" class="text-blue-700 hover:underline" target="_blank">{{ u }}</a>
+          </li>
+        {% endfor %}
+      </ul>
+    </details>
+  {% endif %}
+{% endcall %}
+
 
   {% else %}
     <div class="bg-white border rounded-lg p-6 text-slate-600">
