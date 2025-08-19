@@ -44,117 +44,11 @@ PSI_TIMEOUT = int(os.getenv("PSI_TIMEOUT", "20"))              # per strategy se
 USE_LXML = os.getenv("USE_LXML", "1") == "1"
 
 # ---------- Constants ----------
-# --- add near imports ---
-
-# --- add constants once ---
-_CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-    USER_AGENT = os.getenv("USER_AGENT", _CHROME_UA)
+USER_AGENT = (
+    "SEO-Inspector/1.1 (+https://example.com) "
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-
-_BASE_HEADERS = {
-    "User-Agent": _CHROME_UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Sec-Fetch-Dest": "document",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache",
-}
-
-_ALT_HEADERS = {
-    **_BASE_HEADERS,
-    # slightly different fingerprint; drop br, add platform hints
-    "Accept-Encoding": "gzip, deflate",
-    "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
-
-_MOBILE_HEADERS = {
-    **_BASE_HEADERS,
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-    ),
-    "sec-ch-ua-mobile": "?1",
-}
-
-_ANTIBOT_MARKERS = (
-    "cloudflare", "attention required", "just a moment", "cf-chl",
-    "incapsula", "sucuri", "access denied", "request blocked",
-    "unusual traffic", "bot detected", "verify you are human"
-)
-
-def _looks_like_antibot(resp: requests.Response) -> bool:
-    if resp.status_code in (401, 403, 429, 503):
-        return True
-    text = (resp.text or "")[:5000].lower()
-    if any(tok in text for tok in _ANTIBOT_MARKERS):
-        return True
-    server = resp.headers.get("server", "").lower()
-    if any(v in server for v in ("cloudflare", "akamai", "sucuri")):
-        # not definitive, but combined with tiny HTML is suspicious
-        if len(resp.text or "") < 1500:
-            return True
-    # some WAFs send non-HTML with 200
-    ctype = resp.headers.get("content-type", "")
-    if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
-        # allow JSON for APIs; but for page scan treat as suspicious
-        return True
-    return False
-
-def fetch_html_hardened(url: str, referer: str | None = None, timeout_s: int = 25):
-    """Return (response, html, meta) or raise. Tries 3 header profiles."""
-    sess = requests.Session()
-    sess.trust_env = False  # ignore proxy envs that sometimes trigger WAF
-    tries = []
-
-    h1 = dict(_BASE_HEADERS)
-    if referer:
-        h1["Referer"] = referer
-    tries.append(h1)
-
-    h2 = dict(_ALT_HEADERS)
-    if referer:
-        h2["Referer"] = referer
-    tries.append(h2)
-
-    h3 = dict(_MOBILE_HEADERS)
-    if referer:
-        h3["Referer"] = referer
-    tries.append(h3)
-
-    last_exc = None
-    last_resp = None
-    for i, hdrs in enumerate(tries, 1):
-        try:
-            r = sess.get(url, headers=hdrs, allow_redirects=True, timeout=(10, timeout_s))
-            last_resp = r
-            if not _looks_like_antibot(r):
-                return r, (r.text or ""), {"ua": hdrs["User-Agent"], "attempt": i, "final_url": str(r.url)}
-            # try next fingerprint
-        except Exception as e:
-            last_exc = e
-
-    # If all attempts look blocked, return what we have with a warning
-    if last_resp is not None:
-        meta = {
-            "ua": last_resp.request.headers.get("User-Agent"),
-            "attempt": len(tries),
-            "final_url": str(last_resp.url),
-            "warning": f"Likely blocked/challenged by WAF (HTTP {last_resp.status_code}).",
-        }
-        return last_resp, (last_resp.text or ""), meta
-
-    raise last_exc or RuntimeError("Failed to fetch URL")
-
 
 STOPWORDS = set("""
 a an the and or but if then else for to of in on at by with from as this that those these is are be was were been being
@@ -653,16 +547,11 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "microdata": [],
         "rdfa": [],
         "sd_types": {"types": []},
-        "errors": [],
-        "notes": {},
     }
 
-    # --- Fetch page (hardened to bypass common WAF/bot blocks) ---
+    # --- Fetch page ---
     try:
-        t0 = time.perf_counter()
-        # IMPORTANT: use the original input `url` here
-        resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/")
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        resp, elapsed_ms = _fetch(url)
     except Exception as e:
         result["performance"] = {
             "final_url": url,
@@ -675,19 +564,13 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
             "desktop_score": None,
         }
         result["pagespeed"] = {"enabled": False, "message": f"Fetch failed: {e}"}
-        result["errors"].append(f"Fetch failed: {e}")
         return result
 
-    final_url = str(resp.url)                # after redirects
+    final_url = resp.url
     status = resp.status_code
-    body_bytes = html_text.encode(resp.encoding or "utf-8", errors="ignore")
-    content_len = len(body_bytes)
-    soup = _soup_parse(body_bytes, final_url)
-
-    # Surface fetch details/warnings to the UI
-    result["notes"] = {"fetch": fetch_meta}
-    if "warning" in fetch_meta:
-        result["errors"].append(fetch_meta["warning"])
+    body = resp.content or b""
+    content_len = len(body)
+    soup = _soup_parse(body, final_url)
 
     # --- Security headers (from main response) ---
     security = _audit_security_headers(resp.headers)
@@ -741,7 +624,8 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     crawl = _robots_and_sitemaps(final_url)
     sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
     sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
-    orphans = [u for u in sitemap_sample if u not in set(internal)]  # quick orphan candidates
+    # quick orphan candidates = present in sitemap but not linked on this page
+    orphans = [u for u in sitemap_sample if u not in set(internal)]
 
     # --- Link status (concurrent & sampled) ---
     link_checks = _sample_status(internal, external, fast=fast)
@@ -844,7 +728,6 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "json_ld": json_ld,
         "microdata": [],
         "rdfa": [],
-        "sd_types": {"types": list({item.get("@type") for item in json_ld
-                                    if isinstance(item, dict) and item.get("@type")}) if json_ld else []},
+        "sd_types": {"types": list({item.get("@type") for item in json_ld if isinstance(item, dict) and item.get("@type")}) if json_ld else []},
     })
     return result
