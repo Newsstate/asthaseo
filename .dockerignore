@@ -1,0 +1,14 @@
+# Speed up builds, keep image slim
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+.node_modules/
+.playwright/
