@@ -3,7 +3,8 @@ import sys
 import asyncio
 from time import time
 from typing import Dict, Tuple, Any
-
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -13,6 +14,8 @@ from pathlib import Path
 from .seo import analyze as analyze_url
 from .db import init_db, save_analysis
 
+BASE_DIR = Path(__file__).resolve().parents[1]  # project root (where /static lives)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 # --- Windows asyncio policy fix (safe no-op elsewhere) ---
 if sys.platform.startswith("win"):
     try:
@@ -36,7 +39,7 @@ if env_templates:
         TEMPLATES_DIR = candidate
 
 # Create the Jinja environment
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 # ------------------------------------------------------------------------------
 # AMP vs Non-AMP comparison: cache + helpers
 # ------------------------------------------------------------------------------
