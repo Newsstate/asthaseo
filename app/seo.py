@@ -9,19 +9,40 @@ import html
 import string
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse, urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
+# ---------- Tunables via env ----------
+# Overall "fast mode" (skips PSI, trims sampling)
+FAST_MODE_DEFAULT = os.getenv("FAST_MODE_DEFAULT", "1") == "1"
+
+# Timeouts (seconds)
+HTTP_TIMEOUT_MAIN = float(os.getenv("HTTP_TIMEOUT_MAIN", "10"))   # main page GET
+HTTP_TIMEOUT_HEAD = float(os.getenv("HTTP_TIMEOUT_HEAD", "5"))    # link HEADs
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
+
+# Concurrency & sampling
+HEAD_MAX_WORKERS = int(os.getenv("HEAD_MAX_WORKERS", "16"))
+HEAD_SAMPLE_INTERNAL = int(os.getenv("HEAD_SAMPLE_INTERNAL", "4"))
+HEAD_SAMPLE_EXTERNAL = int(os.getenv("HEAD_SAMPLE_EXTERNAL", "4"))
+
+# PSI (PageSpeed) control
+ENABLE_PSI = os.getenv("ENABLE_PSI", "1") == "1"
+PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
+
+# Parser: try lxml (faster) if installed
+USE_LXML = os.getenv("USE_LXML", "1") == "1"
+
+# ---------- Constants ----------
 USER_AGENT = (
     "SEO-Inspector/1.1 (+https://example.com) "
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-TIMEOUT = 15
-HEAD_SAMPLE = 8
-
-PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
 
 STOPWORDS = set("""
 a an the and or but if then else for to of in on at by with from as this that those these is are be was were been being
@@ -31,6 +52,30 @@ also am among amongst around because before behind below beneath beside besides 
 more most much many nor off over under up down out into than too very via per just so only such own same very
 """.split())
 
+# ---------- HTTP Session (pooled) ----------
+_SESSION: requests.Session | None = None
+
+def _get_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        retry = Retry(
+            total=1,  # one quick retry on transient errors
+            backoff_factor=0.1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET"],
+        )
+        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retry)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        s.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+        _SESSION = s
+    return _SESSION
+
+# ---------- Helpers ----------
 def _normalize_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
@@ -40,10 +85,22 @@ def _normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
+def _soup_parse(body: bytes, base_url: str) -> BeautifulSoup:
+    if USE_LXML:
+        try:
+            return BeautifulSoup(body, "lxml")
+        except Exception:
+            pass
+    return BeautifulSoup(body, "html.parser")
+
 def _fetch(url: str) -> Tuple[requests.Response, float]:
-    headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate, br"}
+    s = _get_session()
     start = time.perf_counter()
-    resp = requests.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+    resp = s.get(
+        url,
+        allow_redirects=True,
+        timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_MAIN),
+    )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     return resp, elapsed_ms
 
@@ -95,9 +152,7 @@ def _check_indexability(robots_meta: str | None, x_robots: str | None) -> Tuple[
 
 def _detect_amp(soup: BeautifulSoup, base_url: str) -> Tuple[bool, str | None]:
     html_tag = soup.find("html")
-    is_amp = False
-    if html_tag:
-        is_amp = bool(html_tag.has_attr("amp") or html_tag.has_attr("⚡"))
+    is_amp = bool(html_tag and (html_tag.has_attr("amp") or html_tag.has_attr("⚡")))
     amp_link = soup.find("link", rel=lambda v: v and "amphtml" in v.lower())
     amp_url = urljoin(base_url, amp_link["href"]) if amp_link and amp_link.get("href") else None
     return is_amp, amp_url
@@ -113,18 +168,14 @@ def _hreflang_links(soup: BeautifulSoup, base: str) -> List[Dict[str, str]]:
     return out
 
 def _extract_links(soup: BeautifulSoup, base: str) -> Tuple[List[str], List[str], List[str]]:
-    parsed = urlparse(base)
-    host = parsed.netloc.lower()
+    host = urlparse(base).netloc.lower()
     internal, external, nofollow = [], [], []
     for a in soup.find_all("a", href=True):
         href = urljoin(base, a["href"].strip())
         netloc = urlparse(href).netloc.lower()
         rel = (a.get("rel") or [])
         reltxt = " ".join(rel).lower() if isinstance(rel, list) else str(rel).lower()
-        if host and netloc == host:
-            internal.append(href)
-        else:
-            external.append(href)
+        (internal if (host and netloc == host) else external).append(href)
         if "nofollow" in reltxt:
             nofollow.append(href)
 
@@ -137,53 +188,67 @@ def _extract_links(soup: BeautifulSoup, base: str) -> Tuple[List[str], List[str]
 
     return _dedup(internal), _dedup(external), _dedup(nofollow)
 
-def _sample_status(urls: List[str]) -> List[Dict[str, Any]]:
-    headers = {"User-Agent": USER_AGENT}
-    out = []
-    for url in urls[:HEAD_SAMPLE]:
-        try:
-            r = requests.head(url, headers=headers, allow_redirects=True, timeout=TIMEOUT)
-            out.append({
-                "url": url,
-                "final_url": r.url,
-                "status": r.status_code,
-                "redirects": len(r.history)
-            })
-        except Exception as e:
-            out.append({"url": url, "status": None, "redirects": 0, "error": str(e)})
-    return out
+def _head_one(url: str) -> Dict[str, Any]:
+    s = _get_session()
+    try:
+        r = s.head(url, allow_redirects=True, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
+        return {"url": url, "final_url": r.url, "status": r.status_code, "redirects": len(r.history)}
+    except Exception as e:
+        return {"url": url, "status": None, "redirects": 0, "error": str(e)}
+
+def _sample_status(internal: List[str], external: List[str], fast: bool) -> Dict[str, List[Dict[str, Any]]]:
+    # trim samples
+    n_int = max(0, HEAD_SAMPLE_INTERNAL // (2 if fast else 1))
+    n_ext = max(0, HEAD_SAMPLE_EXTERNAL // (2 if fast else 1))
+    ints = internal[:n_int or HEAD_SAMPLE_INTERNAL]
+    exts = external[:n_ext or HEAD_SAMPLE_EXTERNAL]
+
+    rows_int: List[Dict[str, Any]] = []
+    rows_ext: List[Dict[str, Any]] = []
+    tasks = {u: ("int", u) for u in ints} | {u: ("ext", u) for u in exts}
+
+    if not tasks:
+        return {"internal": [], "external": []}
+
+    with ThreadPoolExecutor(max_workers=min(HEAD_MAX_WORKERS, len(tasks))) as tp:
+        futs = {tp.submit(_head_one, u): (kind, u) for u, (kind, _) in tasks.items()}
+        for f in as_completed(futs):
+            kind, _u = futs[f]
+            row = f.result()
+            (rows_int if kind == "int" else rows_ext).append(row)
+
+    return {"internal": rows_int, "external": rows_ext}
 
 def _robots_and_sitemaps(base: str) -> Dict[str, Any]:
-    parsed = urlparse(base)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    headers = {"User-Agent": USER_AGENT}
+    robots_url = f"{urlparse(base).scheme}://{urlparse(base).netloc}/robots.txt"
+    s = _get_session()
     sitemaps: List[Dict[str, Any]] = []
-    blocked_by_robots: bool | None = None
     try:
-        r = requests.get(robots_url, headers=headers, timeout=TIMEOUT)
+        r = s.get(robots_url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
         if r.status_code == 200 and r.text:
             for line in r.text.splitlines():
                 if line.lower().startswith("sitemap:"):
                     sm_url = line.split(":", 1)[1].strip()
                     try:
-                        h = requests.head(sm_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+                        h = s.head(sm_url, allow_redirects=True, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
                         sitemaps.append({"url": sm_url, "status": h.status_code})
                     except Exception as e:
                         sitemaps.append({"url": sm_url, "error": str(e)})
     except Exception as e:
         sitemaps = [{"url": None, "error": f"robots fetch failed: {e}"}]
-    return {"robots_url": robots_url, "sitemaps": sitemaps, "blocked_by_robots": blocked_by_robots}
+    return {"robots_url": robots_url, "sitemaps": sitemaps, "blocked_by_robots": None}
 
 def _pagespeed(url: str) -> Dict[str, Any]:
-    if not PAGESPEED_API_KEY:
-        return {"enabled": False, "message": "Set PAGESPEED_API_KEY to enable PageSpeed"}
+    # If no key or disabled, return "off"
+    if not (ENABLE_PSI and PAGESPEED_API_KEY):
+        return {"enabled": False, "message": "PageSpeed disabled or missing API key"}
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-    headers = {"User-Agent": USER_AGENT}
+    s = _get_session()
     out = {"enabled": True, "mobile": {"metrics": {}}, "desktop": {"metrics": {}}}
 
     def call(strategy: str) -> Dict[str, Any]:
         params = {"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY}
-        r = requests.get(base, headers=headers, params=params, timeout=30)
+        r = s.get(base, params=params, timeout=(HTTP_CONNECT_TIMEOUT, 30))
         r.raise_for_status()
         data = r.json()
         lr = data.get("lighthouseResult", {})
@@ -203,8 +268,7 @@ def _pagespeed(url: str) -> Dict[str, Any]:
             "Speed Index (ms)": metr("speed-index"),
             "Time To Interactive (ms)": metr("interactive"),
         }
-        clean = {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
-        return {"score": score and round(score * 100), "metrics": clean}
+        return {"score": score and round(score * 100), "metrics": {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}}
 
     try:
         out["mobile"].update(call("mobile"))
@@ -217,8 +281,11 @@ def _pagespeed(url: str) -> Dict[str, Any]:
 
     return out
 
-def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
+# ---------- Public entry ----------
+def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, Any]:
+    fast = FAST_MODE_DEFAULT if fast is None else fast
     url = _normalize_url(target_url)
+
     result: Dict[str, Any] = {
         "url": url,
         "status_code": None,
@@ -253,6 +320,7 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
         "sd_types": {"types": []},
     }
 
+    # --- Fetch page ---
     try:
         resp, elapsed_ms = _fetch(url)
     except Exception as e:
@@ -273,8 +341,9 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
     status = resp.status_code
     body = resp.content or b""
     content_len = len(body)
-    soup = BeautifulSoup(body, "html.parser")
+    soup = _soup_parse(body, final_url)
 
+    # --- Meta basics ---
     title = (soup.title.string.strip() if (soup.title and soup.title.string) else None)
     m_desc = soup.find("meta", attrs={"name": "description"})
     meta_desc = m_desc.get("content").strip() if m_desc and m_desc.get("content") else None
@@ -297,16 +366,18 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
     http_version = "HTTP/1.1"
     is_https = final_url.startswith("https")
 
+    # --- OG / Twitter ---
     og, tw = _collect_metas(soup)
     has_og = bool(og)
     has_twitter = bool(tw)
 
+    # --- AMP ---
     is_amp, amp_url = _detect_amp(soup, final_url)
 
-    heads = {}
-    for lvl in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-        heads[lvl] = [h.get_text(strip=True) for h in soup.find_all(lvl)]
+    # --- Headings ---
+    heads = {lvl: [h.get_text(strip=True) for h in soup.find_all(lvl)] for lvl in ["h1","h2","h3","h4","h5","h6"]}
 
+    # --- Links & images ---
     internal, external, nofollow = _extract_links(soup, final_url)
     images = soup.find_all("img")
     imgs_missing = [{"src": urljoin(final_url, (im.get("src") or ""))} for im in images if not (im.get("alt") or "").strip()]
@@ -314,13 +385,16 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
     miss_count = len(imgs_missing)
     alt_percent = round(100.0 * (total_imgs - miss_count) / total_imgs, 2) if total_imgs else 100.0
 
+    # --- Keyword density (keep lightweight) ---
     kd = _get_text_density(soup)
-    crawl = _robots_and_sitemaps(final_url)
-    link_checks = {
-        "internal": _sample_status(internal),
-        "external": _sample_status(external),
-    }
 
+    # --- robots & sitemaps ---
+    crawl = _robots_and_sitemaps(final_url)
+
+    # --- Link status (concurrent & sampled) ---
+    link_checks = _sample_status(internal, external, fast=fast)
+
+    # --- Indexability / checks ---
     indexable_ok, indexable_val = _check_indexability(robots_meta, x_robots)
     checks = {
         "canonical": {"ok": bool(canonical), "value": canonical},
@@ -338,6 +412,7 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
         "compression": {"ok": (enc in ["gzip", "br", "deflate"]), "value": enc},
     }
 
+    # --- Performance summary ---
     perf = {
         "final_url": final_url,
         "http_version": http_version,
@@ -349,11 +424,13 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
         "desktop_score": None,
     }
 
-    ps = _pagespeed(final_url)
+    # --- PageSpeed (skip if fast mode) ---
+    ps = {"enabled": False, "message": "Skipped (FAST_MODE_DEFAULT)"} if fast else _pagespeed(final_url)
     if ps.get("enabled"):
         perf["mobile_score"] = ps.get("mobile", {}).get("score")
         perf["desktop_score"] = ps.get("desktop", {}).get("score")
 
+    # --- JSON-LD quick scan ---
     json_ld = []
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
@@ -376,12 +453,7 @@ def get_pagespeed_data(target_url: str) -> Dict[str, Any]:
         "has_twitter_card": has_twitter,
         "open_graph": og,
         "twitter_card": tw,
-        "h1": heads["h1"],
-        "h2": heads["h2"],
-        "h3": heads["h3"],
-        "h4": heads["h4"],
-        "h5": heads["h5"],
-        "h6": heads["h6"],
+        "h1": heads["h1"], "h2": heads["h2"], "h3": heads["h3"], "h4": heads["h4"], "h5": heads["h5"], "h6": heads["h6"],
         "keyword_density_top": kd,
         "hreflang": _hreflang_links(soup, final_url),
         "images_missing_alt": imgs_missing,
