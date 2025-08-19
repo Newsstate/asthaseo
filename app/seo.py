@@ -17,10 +17,10 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 # ---------- Tunables via env ----------
-# Overall "fast mode" (skips PSI, trims sampling)
+# Overall "fast mode"
 FAST_MODE_DEFAULT = os.getenv("FAST_MODE_DEFAULT", "1") == "1"
 
-# Timeouts (seconds)
+# Page fetch timeouts (seconds)
 HTTP_TIMEOUT_MAIN = float(os.getenv("HTTP_TIMEOUT_MAIN", "10"))   # main page GET
 HTTP_TIMEOUT_HEAD = float(os.getenv("HTTP_TIMEOUT_HEAD", "5"))    # link HEADs
 HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
@@ -33,6 +33,10 @@ HEAD_SAMPLE_EXTERNAL = int(os.getenv("HEAD_SAMPLE_EXTERNAL", "4"))
 # PSI (PageSpeed) control
 ENABLE_PSI = os.getenv("ENABLE_PSI", "1") == "1"
 PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
+# ✅ NEW: include PSI inside fast mode, and keep it quick
+PSI_IN_FAST = os.getenv("PSI_IN_FAST", "1") == "1"             # run PSI even in fast mode
+PSI_STRATEGY_FAST = os.getenv("PSI_STRATEGY_FAST", "mobile")   # mobile|desktop|both
+PSI_TIMEOUT = int(os.getenv("PSI_TIMEOUT", "20"))              # per strategy seconds
 
 # Parser: try lxml (faster) if installed
 USE_LXML = os.getenv("USE_LXML", "1") == "1"
@@ -60,7 +64,7 @@ def _get_session() -> requests.Session:
     if _SESSION is None:
         s = requests.Session()
         retry = Retry(
-            total=1,  # one quick retry on transient errors
+            total=1,
             backoff_factor=0.1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET"],
@@ -85,7 +89,7 @@ def _normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-def _soup_parse(body: bytes, base_url: str) -> BeautifulSoup:
+def _soup_parse(body: bytes, _base_url: str) -> BeautifulSoup:
     if USE_LXML:
         try:
             return BeautifulSoup(body, "lxml")
@@ -197,7 +201,6 @@ def _head_one(url: str) -> Dict[str, Any]:
         return {"url": url, "status": None, "redirects": 0, "error": str(e)}
 
 def _sample_status(internal: List[str], external: List[str], fast: bool) -> Dict[str, List[Dict[str, Any]]]:
-    # trim samples
     n_int = max(0, HEAD_SAMPLE_INTERNAL // (2 if fast else 1))
     n_ext = max(0, HEAD_SAMPLE_EXTERNAL // (2 if fast else 1))
     ints = internal[:n_int or HEAD_SAMPLE_INTERNAL]
@@ -238,47 +241,73 @@ def _robots_and_sitemaps(base: str) -> Dict[str, Any]:
         sitemaps = [{"url": None, "error": f"robots fetch failed: {e}"}]
     return {"robots_url": robots_url, "sitemaps": sitemaps, "blocked_by_robots": None}
 
-def _pagespeed(url: str) -> Dict[str, Any]:
-    # If no key or disabled, return "off"
-    if not (ENABLE_PSI and PAGESPEED_API_KEY):
-        return {"enabled": False, "message": "PageSpeed disabled or missing API key"}
+# ---------- PageSpeed ----------
+def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     s = _get_session()
+    params = {"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY}
+    r = s.get(base, params=params, timeout=(HTTP_CONNECT_TIMEOUT, timeout_sec))
+    r.raise_for_status()
+    data = r.json()
+    lr = data.get("lighthouseResult", {})
+    audits = lr.get("audits", {})
+    cat = lr.get("categories", {}).get("performance", {})
+    score = cat.get("score")
+
+    def metr(audit_key: str):
+        v = audits.get(audit_key, {}).get("numericValue")
+        return v if v is not None else None
+
+    metrics = {
+        "First Contentful Paint (ms)": metr("first-contentful-paint"),
+        "Largest Contentful Paint (ms)": metr("largest-contentful-paint"),
+        "Cumulative Layout Shift": audits.get("cumulative-layout-shift", {}).get("numericValue"),
+        "Total Blocking Time (ms)": metr("total-blocking-time"),
+        "Speed Index (ms)": metr("speed-index"),
+        "Time To Interactive (ms)": metr("interactive"),
+    }
+    return {"score": score and round(score * 100), "metrics": {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}}
+
+def _pagespeed_full(url: str) -> Dict[str, Any]:
+    if not (ENABLE_PSI and PAGESPEED_API_KEY):
+        return {"enabled": False, "message": "PageSpeed disabled or missing API key"}
     out = {"enabled": True, "mobile": {"metrics": {}}, "desktop": {"metrics": {}}}
-
-    def call(strategy: str) -> Dict[str, Any]:
-        params = {"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY}
-        r = s.get(base, params=params, timeout=(HTTP_CONNECT_TIMEOUT, 30))
-        r.raise_for_status()
-        data = r.json()
-        lr = data.get("lighthouseResult", {})
-        audits = lr.get("audits", {})
-        cat = lr.get("categories", {}).get("performance", {})
-        score = cat.get("score")
-
-        def metr(audit_key: str):
-            v = audits.get(audit_key, {}).get("numericValue")
-            return v if v is not None else None
-
-        metrics = {
-            "First Contentful Paint (ms)": metr("first-contentful-paint"),
-            "Largest Contentful Paint (ms)": metr("largest-contentful-paint"),
-            "Cumulative Layout Shift": audits.get("cumulative-layout-shift", {}).get("numericValue"),
-            "Total Blocking Time (ms)": metr("total-blocking-time"),
-            "Speed Index (ms)": metr("speed-index"),
-            "Time To Interactive (ms)": metr("interactive"),
-        }
-        return {"score": score and round(score * 100), "metrics": {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}}
-
     try:
-        out["mobile"].update(call("mobile"))
+        out["mobile"].update(_psi_call(url, "mobile", timeout_sec=30))
     except Exception as e:
         out["mobile"]["error"] = str(e)
     try:
-        out["desktop"].update(call("desktop"))
+        out["desktop"].update(_psi_call(url, "desktop", timeout_sec=30))
     except Exception as e:
         out["desktop"]["error"] = str(e)
+    return out
 
+def _pagespeed_fast(url: str) -> Dict[str, Any]:
+    """
+    Faster PSI: chooses strategy via PSI_STRATEGY_FAST and uses shorter timeout.
+    """
+    if not (ENABLE_PSI and PAGESPEED_API_KEY):
+        return {"enabled": False, "message": "PageSpeed disabled or missing API key"}
+    strat = PSI_STRATEGY_FAST.lower()
+    out = {"enabled": True, "mobile": {"metrics": {}}, "desktop": {"metrics": {}}}
+
+    if strat in ("mobile", "desktop"):
+        try:
+            data = _psi_call(url, strat, timeout_sec=PSI_TIMEOUT)
+            out[strat].update(data)
+        except Exception as e:
+            out[strat]["error"] = str(e)
+        return out
+
+    # both (still quick; runs sequentially to avoid oversubscription)
+    try:
+        out["mobile"].update(_psi_call(url, "mobile", timeout_sec=PSI_TIMEOUT))
+    except Exception as e:
+        out["mobile"]["error"] = str(e)
+    try:
+        out["desktop"].update(_psi_call(url, "desktop", timeout_sec=PSI_TIMEOUT))
+    except Exception as e:
+        out["desktop"]["error"] = str(e)
     return out
 
 # ---------- Public entry ----------
@@ -385,7 +414,7 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     miss_count = len(imgs_missing)
     alt_percent = round(100.0 * (total_imgs - miss_count) / total_imgs, 2) if total_imgs else 100.0
 
-    # --- Keyword density (keep lightweight) ---
+    # --- Keyword density ---
     kd = _get_text_density(soup)
 
     # --- robots & sitemaps ---
@@ -424,8 +453,12 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "desktop_score": None,
     }
 
-    # --- PageSpeed (skip if fast mode) ---
-    ps = {"enabled": False, "message": "Skipped (FAST_MODE_DEFAULT)"} if fast else _pagespeed(final_url)
+    # --- PageSpeed ---
+    if fast:
+        ps = _pagespeed_fast(final_url) if PSI_IN_FAST else {"enabled": False, "message": "Skipped (FAST_MODE_DEFAULT)"}
+    else:
+        ps = _pagespeed_full(final_url)
+
     if ps.get("enabled"):
         perf["mobile_score"] = ps.get("mobile", {}).get("score")
         perf["desktop_score"] = ps.get("desktop", {}).get("score")
