@@ -474,41 +474,10 @@
           {{ krow('SSL OK', result.performance.https.ssl_ok if result.performance else '—') }}
         </div>
       </div>
+  
     {% endcall %}
 
-    {% call section('Rendered vs Static Comparison', false) %}
-      {% if rendered_matrix %}
-        <div class="overflow-x-auto">
-          <table class="min-w-full text-sm">
-            <thead class="text-left text-slate-500">
-              <tr><th class="py-1 pr-3">Metric</th><th class="py-1 pr-3">Static</th><th class="py-1 pr-3">Rendered</th><th class="py-1">Changed?</th></tr>
-            </thead>
-            <tbody>
-              {% for row in rendered_matrix %}
-                <tr class="border-t">
-                  <td class="py-1 pr-3">{{ row.label }}</td>
-                  <td class="py-1 pr-3 break-all">{{ row.before }}</td>
-                  <td class="py-1 pr-3 break-all">{{ row.after }}</td>
-                  <td class="py-1">{{ badge(not not row.changed, row.changed and 'Yes' or 'No') }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      {% else %}
-        <div class="text-sm text-slate-500">
-          Rendered DOM check skipped or failed.
-          {% set err = (result.rendered_diff.error if result.rendered_diff and result.rendered_diff.error else '') %}
-          <div class="mt-2 text-xs text-slate-600">Possible reasons: Playwright/Chromium not installed, sandbox blocked, timeout, or CSP blocking resources.</div>
-          {% if err %}<div class="text-xs text-red-600 mt-1">{{ err }}</div>{% endif %}
-          <ul class="list-disc list-inside mt-2 text-xs text-slate-600">
-            <li>Install Playwright browsers on the server (e.g., <code>playwright install --with-deps chromium</code>).</li>
-            <li>Ensure headless Chromium can run (fonts, libc, shared libs).</li>
-            <li>Increase render timeout if your server supports it.</li>
-          </ul>
-        </div>
-      {% endif %}
-    {% endcall %}
+   
 
     {% call section('Raw Result (JSON)', false) %}
       <pre class="text-xs bg-slate-900 text-slate-100 rounded-md p-4 overflow-x-auto">{{ result|tojson(indent=2) }}</pre>
