@@ -1,4 +1,3 @@
-{# app/templates/index.html #}
 {% extends "base.html" %}
 {% block content %}
 
@@ -12,8 +11,7 @@
         <input id="urlInput" type="url" name="url" placeholder="Enter URL (https://…)" required
                class="flex-1 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                value="{{ request.query_params['url'] if request and request.query_params and 'url' in request.query_params else '' }}">
-        <button type="submit" id="analyzeBtn"
-                class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md inline-flex items-center gap-2">
+        <button id="analyzeBtn" type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md inline-flex items-center gap-2">
           <span id="analyzeBtnText">Analyze</span>
           <svg id="analyzeSpinner" class="w-4 h-4 animate-spin hidden" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -27,13 +25,11 @@
           const btn = document.getElementById('analyzeBtn');
           const text = document.getElementById('analyzeBtnText');
           const spinner = document.getElementById('analyzeSpinner');
-          if (!form || !btn || !text || !spinner) return;
-
+          if (!form) return;
           form.addEventListener('submit', function () {
-            btn.disabled = true;
-            btn.classList.add('opacity-75', 'cursor-not-allowed');
-            spinner.classList.remove('hidden');     // show spinner
-            text.textContent = 'Analyzing…';        // change button text
+            if (btn) { btn.disabled = true; btn.classList.add('opacity-75','cursor-not-allowed'); }
+            if (spinner) spinner.classList.remove('hidden');
+            if (text) { text.textContent = 'Analyzing…'; text.classList.add('animate-pulse'); }
           });
         })();
       </script>
@@ -41,49 +37,10 @@
   </div>
 
   {% if result and result.amp_url %}
-    <a href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
-       target="_blank" rel="noopener"
-       class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 inline-block">
+    <a href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}" target="_blank"
+       class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">
       AMP vs Non-AMP
     </a>
-  {% endif %}
-
-  {% if result and result.is_amp and result.amp_url %}
-  <!-- AMP Controls -->
-  <div class="bg-white border rounded-lg p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-    <div class="flex items-center gap-2 flex-wrap">
-      <span class="text-sm text-slate-600">Variant:</span>
-      <select id="variantSelect" class="border rounded-md px-2 py-1 text-sm">
-        <option value="{{ result.url }}">Canonical</option>
-        <option value="{{ result.amp_url }}">AMP</option>
-      </select>
-      <button id="loadVariantBtn" class="text-sm bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md">Load Variant</button>
-      <span class="text-slate-500 text-sm">Quick compare:</span>
-      <button id="compareAmpBtn" class="text-sm bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-md">Open AMP & Canonical</button>
-    </div>
-
-    {# Optional: prefetch to make external pages pop instantly #}
-    <link rel="prefetch" href="{{ result.url }}">
-    <link rel="prefetch" href="{{ result.amp_url }}">
-    <link rel="prefetch" href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}">
-
-    <div class="text-xs text-slate-500">Tip: use the dropdown to re-run the analysis for AMP vs non-AMP. The compare button opens both reports in new tabs.</div>
-  </div>
-  <form id="ampFormCanonical" action="/analyze" method="post" target="_blank" class="hidden"><input type="hidden" name="url" value="{{ result.url }}"></form>
-  <form id="ampFormAmp" action="/analyze" method="post" target="_blank" class="hidden"><input type="hidden" name="url" value="{{ result.amp_url }}"></form>
-  <script>
-    (function(){
-      const sel = document.getElementById('variantSelect');
-      const btn = document.getElementById('loadVariantBtn');
-      const mainForm = document.getElementById('mainAnalyzeForm');
-      const urlInput = document.getElementById('urlInput');
-      const compareBtn = document.getElementById('compareAmpBtn');
-      const ampFormAmp = document.getElementById('ampFormAmp');
-      const ampFormCanonical = document.getElementById('ampFormCanonical');
-      if(btn){ btn.addEventListener('click', function(e){ e.preventDefault(); urlInput.value = sel.value; mainForm.submit(); }); }
-      if(compareBtn){ compareBtn.addEventListener('click', function(e){ e.preventDefault(); ampFormCanonical.submit(); ampFormAmp.submit(); }); }
-    })();
-  </script>
   {% endif %}
 
   {# ---------- helpers ---------- #}
@@ -116,9 +73,10 @@
   {% endmacro %}
 
   {% if result %}
+    {# normalize shapes #}
     {% set open_graph = result.open_graph if result.open_graph is mapping else {} %}
     {% set twitter = result.twitter_card if result.twitter_card is mapping else {} %}
-    {% set headings = result.headings if result.headings is mapping else {
+    {% set headings = {
       'h1': (result.h1 or []),
       'h2': (result.h2 or []),
       'h3': (result.h3 or []),
@@ -128,14 +86,22 @@
     } %}
     {% set kd = result.keyword_density_top if (result.keyword_density_top is iterable and result.keyword_density_top is not string) else [] %}
     {% set hreflang = result.hreflang if (result.hreflang is iterable and result.hreflang is not string) else [] %}
+    {% set hreflang_validation = result.hreflang_validation if result.hreflang_validation is mapping else {'ok': true, 'errors': []} %}
     {% set images_missing_alt = result.images_missing_alt if (result.images_missing_alt is iterable and result.images_missing_alt is not string) else [] %}
     {% set link_checks_internal = (result.link_checks.internal if result.link_checks and result.link_checks.internal is iterable else []) %}
     {% set link_checks_external = (result.link_checks.external if result.link_checks and result.link_checks.external is iterable else []) %}
     {% set sitemaps = (result.crawl_checks.sitemaps if result.crawl_checks and result.crawl_checks.sitemaps is iterable else []) %}
+    {% set sitemap_summary = result.sitemap_summary if result.sitemap_summary is mapping else {} %}
     {% set ps_mobile_metrics = (result.pagespeed.mobile.metrics if result.pagespeed and result.pagespeed.mobile and result.pagespeed.mobile.metrics is mapping else {}) %}
     {% set ps_desktop_metrics = (result.pagespeed.desktop.metrics if result.pagespeed and result.pagespeed.desktop and result.pagespeed.desktop.metrics is mapping else {}) %}
-    {% set rendered_matrix = (result.rendered_diff.matrix if result.rendered_diff and result.rendered_diff.matrix is iterable else []) %}
+    {% set ps_mobile_field = (result.pagespeed.mobile.field_data if result.pagespeed and result.pagespeed.mobile and result.pagespeed.mobile.field_data is mapping else {}) %}
+    {% set ps_desktop_field = (result.pagespeed.desktop.field_data if result.pagespeed and result.pagespeed.desktop and result.pagespeed.desktop.field_data is mapping else {}) %}
+    {% set assets = result.assets if result.assets is mapping else {'css':[], 'js':[], 'img':[]} %}
+    {% set assets_audit = result.assets_audit if result.assets_audit is mapping else {} %}
+    {% set mixed_content = result.mixed_content if result.mixed_content is mapping else {'affected': 0, 'items': []} %}
+    {% set security_headers = result.security_headers if result.security_headers is mapping else {} %}
 
+    {# ---------- topline cards ---------- #}
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       <div class="bg-white rounded-lg shadow border p-4">
         <div class="text-slate-500 text-sm">Status</div>
@@ -163,18 +129,17 @@
 
     <!-- Actions -->
     <div class="flex flex-wrap items-center gap-2">
-      <a href="{{ result.url }}" target="_blank" rel="noopener"
-         class="inline-flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-md hover:bg-slate-900">
+      <a href="{{ result.url }}" target="_blank" class="inline-flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-md hover:bg-slate-900">
         <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M12.293 2.293a1 1 0 011.414 0l4 4a1 1 0 01-1.414 1.414L14 5.414V13a1 1 0 11-2 0V5.414L9.707 7.707A1 1 0 018.293 6.293l4-4z"/><path d="M3 9a1 1 0 011-1h3a1 1 0 110 2H5v6h10v-2a1 1 0 112 0v3a1 1 0 01-1 1H4a1 1 0 01-1-1V9z"/></svg>
         Open Page
       </a>
-      <button onclick="window.print()"
-              class="inline-flex items-center gap-2 bg-white border px-3 py-2 rounded-md hover:bg-slate-50">
+      <button onclick="window.print()" class="inline-flex items-center gap-2 bg-white border px-3 py-2 rounded-md hover:bg-slate-50">
         <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M6 2a2 2 0 00-2 2v2h12V4a2 2 0 00-2-2H6z"/><path d="M4 8a2 2 0 00-2 2v3h4v3h8v-3h4v-3a2 2 0 01-2-2H4zm3 5h6v2H7v-2z"/></svg>
         Download as PDF
       </button>
     </div>
 
+    <!-- Page Overview -->
     {% call section('Page Overview', true) %}
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
@@ -197,6 +162,7 @@
       </div>
     {% endcall %}
 
+    <!-- SEO Meta -->
     {% call section('SEO Meta', true) %}
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div class="space-y-2">
@@ -235,10 +201,21 @@
           <div class="flex flex-wrap gap-2">
             {% for row in hreflang %}{{ pill((row.hreflang or row.get('hreflang','')) ~ ' → ' ~ (row.href or row.get('href','')), 'violet') }}{% endfor %}
           </div>
+          <div class="mt-2">
+            {{ badge(hreflang_validation.ok, hreflang_validation.ok and 'Hreflang OK' or 'Hreflang Issues') }}
+            {% if not hreflang_validation.ok %}
+              <ul class="list-disc list-inside text-sm mt-2">
+                {% for err in hreflang_validation.errors %}
+                  <li class="break-all">{{ err.type }}{% if err.code %}: {{ err.code }}{% endif %}{% if err.href %} → {{ err.href }}{% endif %}</li>
+                {% endfor %}
+              </ul>
+            {% endif %}
+          </div>
         </div>
       {% endif %}
     {% endcall %}
 
+    <!-- Content Structure -->
     {% call section('Content Structure', true) %}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="bg-slate-50 rounded-md p-4 border">
@@ -273,6 +250,7 @@
       </div>
     {% endcall %}
 
+    <!-- Links -->
     {% call section('Links', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div>
@@ -280,7 +258,7 @@
           <details>
             <summary class="cursor-pointer text-sm">Show list</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in (result.internal_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></li>{% endfor %}
+              {% for u in (result.internal_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
             </ul>
           </details>
         </div>
@@ -289,7 +267,7 @@
           <details>
             <summary class="cursor-pointer text-sm">Show list</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in (result.external_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></li>{% endfor %}
+              {% for u in (result.external_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
             </ul>
           </details>
         </div>
@@ -298,7 +276,7 @@
           <details>
             <summary class="cursor-pointer text-sm">Show list</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in (result.nofollow_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></li>{% endfor %}
+              {% for u in (result.nofollow_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
             </ul>
           </details>
         </div>
@@ -313,7 +291,7 @@
                 <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">URL</th><th class="py-1 pr-3">Status</th><th class="py-1">Redirects</th></tr></thead>
                 <tbody>
                   {% for row in link_checks_internal %}
-                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank" rel="noopener">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
+                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
                   {% else %}
                     <tr><td colspan="3" class="py-2 text-slate-400">No sample</td></tr>
                   {% endfor %}
@@ -328,7 +306,7 @@
                 <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">URL</th><th class="py-1 pr-3">Status</th><th class="py-1">Redirects</th></tr></thead>
                 <tbody>
                   {% for row in link_checks_external %}
-                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank" rel="noopener">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
+                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
                   {% else %}
                     <tr><td colspan="3" class="py-2 text-slate-400">No sample</td></tr>
                   {% endfor %}
@@ -340,6 +318,7 @@
       {% endif %}
     {% endcall %}
 
+    <!-- Media -->
     {% call section('Media (Images)', false) %}
       <div class="flex flex-wrap gap-2 mb-3">
         {{ badge((result.checks.alt_coverage.ok if result.checks else none), 'Alt Coverage ' ~ (result.checks.alt_coverage.percent ~ '%' if result.checks else '')) }}
@@ -348,11 +327,12 @@
       <details>
         <summary class="cursor-pointer text-sm font-medium">Images missing alt ({{ images_missing_alt|length }})</summary>
         <ul class="mt-2 space-y-1 list-disc list-inside">
-          {% for im in images_missing_alt %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ im.src }}" target="_blank" rel="noopener">{{ im.src }}</a></li>{% else %}<li class="text-slate-400">None 🎉</li>{% endfor %}
+          {% for im in images_missing_alt %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ im.src }}" target="_blank">{{ im.src }}</a></li>{% else %}<li class="text-slate-400">None 🎉</li>{% endfor %}
         </ul>
       </details>
     {% endcall %}
 
+    <!-- Structured Data -->
     {% call section('Structured Data', false) %}
       <div class="flex flex-wrap gap-2 mb-4">
         {{ pill('JSON-LD: ' ~ ((result.json_ld or [])|length), 'emerald') }}
@@ -366,31 +346,9 @@
           </div>
         {% endif %}
       </div>
-
-      {% if result.json_ld_validation %}
-        <div class="bg-white border rounded-md p-4">
-          <div class="font-semibold mb-2">JSON-LD Validation</div>
-          <div class="text-sm text-slate-600 mb-2">Items OK: {{ result.json_ld_validation.summary.ok_count }}/{{ result.json_ld_validation.summary.total_items }} {% if result.json_ld_validation.summary.has_errors %}{{ badge(false, 'Has missing required fields') }}{% else %}{{ badge(true, 'All good') }}{% endif %}</div>
-          <details>
-            <summary class="cursor-pointer text-sm">Show details</summary>
-            <div class="mt-2 overflow-x-auto">
-              <table class="min-w-full text-sm">
-                <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">Type</th><th class="py-1 pr-3">Missing</th><th class="py-1">State</th></tr></thead>
-                <tbody>
-                  {% set jsonld_items = (result.json_ld_validation.items if result.json_ld_validation.items is iterable else []) %}
-                  {% for it in jsonld_items %}
-                    <tr class="border-t"><td class="py-1 pr-3">{{ it.type or 'Unknown' }}</td><td class="py-1 pr-3">{{ (it.missing or [])|join(', ') or '—' }}</td><td class="py-1">{{ badge(it.ok, it.ok and 'OK' or 'Check') }}</td></tr>
-                  {% else %}
-                    <tr><td colspan="3" class="py-2 text-slate-400">No items</td></tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-          </details>
-        </div>
-      {% endif %}
     {% endcall %}
 
+    <!-- Indexing & Crawling -->
     {% call section('Indexing & Crawling', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="bg-white border rounded-md p-4">
@@ -398,16 +356,12 @@
           <div class="space-y-1">
             {{ krow('robots.txt', result.robots_url or '—') }}
             {% if result.crawl_checks %}
-              {{ krow('Blocked by robots for this UA', result.crawl_checks.blocked_by_robots if result.crawl_checks.blocked_by_robots is not none else 'Unknown') }}
               <div class="text-sm text-slate-500 mt-3">Sitemaps discovered (from robots.txt)</div>
               <ul class="mt-1 space-y-1 list-disc list-inside">
                 {% for sm in sitemaps %}
                   <li class="break-all">{{ sm.url }} {% if sm.status %}<span class="text-slate-500">(status {{ sm.status }})</span>{% elif sm.note %}<span class="text-slate-500">({{ sm.note }})</span>{% elif sm.error %}<span class="text-red-600">({{ sm.error }})</span>{% endif %}</li>
                 {% else %}<li class="text-slate-400">None</li>{% endfor %}
               </ul>
-              {% if result.sitemap_summary %}
-                <div class="mt-3 text-sm text-slate-600">Sitemap sample URL tags: {{ result.sitemap_summary.total_url_count_sampled }}</div>
-              {% endif %}
             {% endif %}
           </div>
         </div>
@@ -424,8 +378,27 @@
           </div>
         </div>
       </div>
+
+      <!-- Sitemap summary -->
+      <div class="bg-white border rounded-md p-4 mt-6">
+        <div class="font-semibold mb-2">Sitemap Summary</div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {{ krow('Sitemaps Found', sitemap_summary.sitemaps_found or 0) }}
+          {{ krow('Sampled URLs', sitemap_summary.sampled_url_count or 0) }}
+          {{ krow('Possible Orphans (sample)', (sitemap_summary.possible_orphans_sampled or [])|length) }}
+        </div>
+        {% if sitemap_summary.possible_orphans_sampled and (sitemap_summary.possible_orphans_sampled|length) %}
+          <details class="mt-2">
+            <summary class="cursor-pointer text-sm">Show possible orphans (sample)</summary>
+            <ul class="mt-2 space-y-1 list-disc list-inside">
+              {% for u in sitemap_summary.possible_orphans_sampled %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+      </div>
     {% endcall %}
 
+    <!-- Performance -->
     {% call section('Performance', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div class="bg-white border rounded-md p-4">
@@ -436,24 +409,45 @@
           {{ krow('Redirects', result.performance.redirects if result.performance else '—') }}
         </div>
         <div class="bg-white border rounded-md p-4">
-          <div class="font-semibold mb-2">PageSpeed (if enabled)</div>
+          <div class="font-semibold mb-2">PageSpeed (incl. CrUX)</div>
           {% if result.pagespeed and result.pagespeed.enabled %}
             <div class="flex flex-wrap gap-2 mb-2">
               {{ badge(result.performance.mobile_score is not none, 'Mobile: ' ~ (result.performance.mobile_score or '—')) }}
               {{ badge(result.performance.desktop_score is not none, 'Desktop: ' ~ (result.performance.desktop_score or '—')) }}
             </div>
             <details class="mb-2" open>
-              <summary class="cursor-pointer text-sm font-medium">Mobile metrics</summary>
+              <summary class="cursor-pointer text-sm font-medium">Mobile lab metrics</summary>
               <ul class="mt-2 text-sm space-y-1">
                 {% for k,v in ps_mobile_metrics.items() %}<li class="flex justify-between"><span class="text-slate-600">{{ k }}</span><span class="font-medium">{{ v }}</span></li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
               </ul>
             </details>
             <details>
-              <summary class="cursor-pointer text-sm font-medium">Desktop metrics</summary>
+              <summary class="cursor-pointer text-sm font-medium">Desktop lab metrics</summary>
               <ul class="mt-2 text-sm space-y-1">
                 {% for k,v in ps_desktop_metrics.items() %}<li class="flex justify-between"><span class="text-slate-600">{{ k }}</span><span class="font-medium">{{ v }}</span></li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
               </ul>
             </details>
+            <div class="mt-3">
+              <div class="text-sm text-slate-500 mb-1">CrUX Field Data (p75)</div>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="bg-slate-50 rounded-md p-3 border">
+                  <div class="font-medium mb-1">Mobile Field</div>
+                  <div class="text-sm space-y-1">
+                    {{ krow('LCP p75 (ms)', ps_mobile_field.LCP_p75_ms or '—') }}
+                    {{ krow('CLS p75', ps_mobile_field.CLS_p75 or '—') }}
+                    {{ krow('INP p75 (ms)', ps_mobile_field.INP_p75_ms or '—') }}
+                  </div>
+                </div>
+                <div class="bg-slate-50 rounded-md p-3 border">
+                  <div class="font-medium mb-1">Desktop Field</div>
+                  <div class="text-sm space-y-1">
+                    {{ krow('LCP p75 (ms)', ps_desktop_field.LCP_p75_ms or '—') }}
+                    {{ krow('CLS p75', ps_desktop_field.CLS_p75 or '—') }}
+                    {{ krow('INP p75 (ms)', ps_desktop_field.INP_p75_ms or '—') }}
+                  </div>
+                </div>
+              </div>
+            </div>
           {% else %}
             <div class="text-sm text-slate-500">
               Pagespeed API not enabled.
@@ -470,22 +464,73 @@
         <div class="bg-white border rounded-md p-4">
           <div class="font-semibold mb-2">Security</div>
           {{ krow('HTTPS', (result.performance.https.is_https if result.performance else result.url.startswith('https')) and 'Yes' or 'No') }}
-          {{ krow('SSL checked', (result.performance.https.ssl_checked if result.performance else false) and 'Yes' or 'No') }}
-          {{ krow('SSL OK', result.performance.https.ssl_ok if result.performance else '—') }}
+          <div class="mt-3 text-sm">
+            <div class="font-medium mb-1">Security Headers (score {{ (security_headers.score_6 or 0) if security_headers else 0 }}/6)</div>
+            <div class="flex flex-wrap gap-2">
+              {{ badge(security_headers.hsts, 'HSTS') }}
+              {{ badge(security_headers.csp, 'CSP') }}
+              {{ badge(security_headers.xcto == 'nosniff' if security_headers else none, 'X-Content-Type-Options') }}
+              {{ badge(security_headers.xfo in ['DENY','SAMEORIGIN'] if security_headers else none, 'X-Frame-Options') }}
+              {{ badge(security_headers.referrer_policy, 'Referrer-Policy') }}
+              {{ badge(security_headers.permissions_policy, 'Permissions-Policy') }}
+            </div>
+          </div>
         </div>
       </div>
-  
     {% endcall %}
 
-   
+    <!-- Assets & Caching -->
+    {% call section('Assets & Caching', false) %}
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {{ krow('Sampled assets', assets_audit.total_sampled or 0) }}
+        {{ krow('Compressed (%)', assets_audit.compressed_percent is not none and (assets_audit.compressed_percent ~ '%') or '—') }}
+        {{ krow('Cacheable (%)', assets_audit.cacheable_percent is not none and (assets_audit.cacheable_percent ~ '%') or '—') }}
+      </div>
+      {% if assets_audit.big_assets and (assets_audit.big_assets|length) %}
+        <div class="mt-3">
+          <div class="text-sm text-slate-500 mb-1">Largest assets (bytes)</div>
+          <ul class="list-disc list-inside text-sm space-y-1">
+            {% for it in assets_audit.big_assets %}
+              <li class="break-all">{{ it.url }} — {{ it.bytes }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+      {% if assets_audit.legacy_images and (assets_audit.legacy_images|length) %}
+        <div class="mt-3">
+          <div class="text-sm text-slate-500 mb-1">Legacy images (consider WebP/AVIF)</div>
+          <ul class="list-disc list-inside text-sm space-y-1">
+            {% for u in assets_audit.legacy_images %}
+              <li class="break-all"><a href="{{ u }}" class="text-blue-700 hover:underline" target="_blank">{{ u }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    {% endcall %}
 
+    <!-- Mixed Content -->
+    {% call section('Mixed Content (HTTPS)', false) %}
+      <div class="flex items-center gap-2">
+        {{ badge(mixed_content.affected == 0, (mixed_content.affected == 0) and 'No mixed content' or (mixed_content.affected ~ ' insecure assets')) }}
+      </div>
+      {% if mixed_content.items and (mixed_content.items|length) %}
+        <details class="mt-2">
+          <summary class="cursor-pointer text-sm">Show insecure asset URLs</summary>
+          <ul class="mt-2 list-disc list-inside text-sm space-y-1">
+            {% for u in mixed_content.items %}<li class="break-all"><a href="{{ u }}" class="text-blue-700 hover:underline" target="_blank">{{ u }}</a></li>{% endfor %}
+          </ul>
+        </details>
+      {% endif %}
+    {% endcall %}
+
+    <!-- Raw Data (for debugging / export) -->
     {% call section('Raw Result (JSON)', false) %}
       <pre class="text-xs bg-slate-900 text-slate-100 rounded-md p-4 overflow-x-auto">{{ result|tojson(indent=2) }}</pre>
     {% endcall %}
 
   {% else %}
     <div class="bg-white border rounded-lg p-6 text-slate-600">
-      Paste a URL above and hit Analyze to see a full SEO & performance report. The dashboard will include Page Overview, SEO Meta, Content Structure, Links, Media, Structured Data, Indexing & Crawling, Performance metrics, and a Rendered vs Static comparison. Use the “Download as PDF” button to save client-ready reports.
+      Paste a URL above and hit Analyze to see a full SEO & performance report. The dashboard includes Page Overview, SEO Meta, Content Structure, Links, Media, Structured Data, Indexing & Crawling, **Security headers**, **Assets & Caching**, **Mixed Content**, and PageSpeed + **CrUX field data**. Use the “Download as PDF” button to save client-ready reports.
     </div>
   {% endif %}
 </div>
