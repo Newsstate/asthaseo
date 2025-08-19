@@ -1,86 +1,96 @@
 # app/db.py
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import os
+from pathlib import Path
+from typing import Iterator, Optional
 
-from sqlmodel import SQLModel, Session, create_engine, select
-from .models import Analysis, ScheduledScan
+from sqlmodel import SQLModel, create_engine, Session
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 
-ENGINE = None
 
-def init_db(db_url: str = "sqlite:///seo_insight.db"):
+ENGINE: Optional[Engine] = None  # global engine
+
+
+def _default_sqlite_url() -> str:
+    """
+    Prefer Render's persistent disk at /var/data if present,
+    otherwise fall back to a local project file.
+    """
+    if Path("/var/data").exists():
+        return "sqlite:////var/data/seo_insight.db"
+    return "sqlite:///./seo_insight.db"
+
+
+def _prepare_sqlite(db_url: str) -> dict:
+    """
+    For SQLite: ensure the parent directory exists and set connect args.
+    """
+    url = make_url(db_url)
+    connect_args: dict = {}
+    if url.get_backend_name() == "sqlite":
+        db_path = url.database  # e.g., /var/data/seo_insight.db or ./seo_insight.db
+        if db_path:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # Required for SQLite when used in a multi-threaded app server
+        connect_args = {"check_same_thread": False}
+    return connect_args
+
+
+def init_db(db_url: str | None = None) -> Engine:
+    """
+    Initialize the global engine and create tables.
+    - Reads DATABASE_URL from env if not provided.
+    - Safely handles SQLite directory creation.
+    """
+    global ENGINE
+
+    resolved_url = db_url or os.getenv("DATABASE_URL") or _default_sqlite_url()
+    connect_args = _prepare_sqlite(resolved_url)
+
+    engine = create_engine(
+        resolved_url,
+        connect_args=connect_args,
+        pool_pre_ping=True,  # drops stale connections
+    )
+
+    # Import your models BEFORE create_all so tables get registered
+    try:
+        from . import models  # noqa: F401
+    except Exception:
+        # It's fine if you don't have a models module yet.
+        pass
+
+    SQLModel.metadata.create_all(engine)
+    ENGINE = engine
+    return engine
+
+
+def get_engine() -> Engine:
+    """
+    Return the initialized engine (initialize it if needed).
+    """
     global ENGINE
     if ENGINE is None:
-        ENGINE = create_engine(db_url, echo=False)
-    SQLModel.metadata.create_all(ENGINE)
+        ENGINE = init_db()
+    return ENGINE
 
-def _session() -> Session:
-    assert ENGINE is not None, "DB not initialized. Call init_db() at startup."
-    return Session(ENGINE)
 
-# ---------- Analyses ----------
-def save_analysis(
-    *,
-    url: str,
-    result: Dict[str, Any],
-    status_code: int,
-    load_time_ms: int,
-    content_length: int,
-    is_amp: bool,
-) -> Analysis:
-    """Create and persist an Analysis row, return the saved row."""
-    with _session() as s:
-        row = Analysis(
-            url=url,
-            created_at=datetime.utcnow(),
-            is_amp=is_amp,
-            load_time_ms=load_time_ms,
-            content_length=content_length,
-            status_code=status_code,
-            result=result,  # JSON column
-        )
-        s.add(row)
-        s.commit()
-        s.refresh(row)
-        return row
+def create_session() -> Session:
+    """
+    Convenience helper: returns a Session. Remember to close it.
+    """
+    return Session(get_engine())
 
-def list_analyses(limit: int = 50) -> List[Analysis]:
-    with _session() as s:
-        stmt = select(Analysis).order_by(Analysis.id.desc()).limit(limit)
-        return list(s.exec(stmt))
 
-# ---------- Scheduled scans (simple stubs) ----------
-def create_scheduled(
-    *,
-    url: str,
-    frequency: str = "daily",
-    user_email: Optional[str] = None,
-    cron: Optional[str] = None,
-    timezone: Optional[str] = None,
-) -> ScheduledScan:
-    with _session() as s:
-        row = ScheduledScan(
-            url=url,
-            frequency=frequency,
-            user_email=user_email,
-            cron=cron,
-            timezone=timezone,
-            last_run_at=None,
-        )
-        s.add(row)
-        s.commit()
-        s.refresh(row)
-        return row
-
-def list_scheduled() -> List[ScheduledScan]:
-    with _session() as s:
-        stmt = select(ScheduledScan).order_by(ScheduledScan.id.desc())
-        return list(s.exec(stmt))
-
-def delete_scheduled(id: int) -> None:
-    with _session() as s:
-        obj = s.get(ScheduledScan, id)
-        if obj:
-            s.delete(obj)
-            s.commit()
+def get_session() -> Iterator[Session]:
+    """
+    FastAPI dependency:
+        from fastapi import Depends
+        @app.get("/items")
+        def handler(session: Session = Depends(get_session)):
+            ...
+    """
+    with Session(get_engine()) as session:
+        yield session
