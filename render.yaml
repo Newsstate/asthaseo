@@ -1,10 +1,11 @@
+# render.yaml
 services:
   - type: web
     name: seo-insight
     env: python
-    plan: free
+    plan: free                # or 'starter' for better uptime
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     autoDeploy: true
     healthCheckPath: /
     envVars:
