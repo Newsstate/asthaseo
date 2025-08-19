@@ -1,3 +1,4 @@
+{# app/templates/index.html #}
 {% extends "base.html" %}
 {% block content %}
 
@@ -8,42 +9,44 @@
 
     <div class="flex-1 sm:max-w-xl">
       <form id="mainAnalyzeForm" action="/analyze" method="post" class="flex gap-2 w-full">
-        <input id="urlInput" type="url" name="url" placeholder="Enter URL (https://…)" required class="flex-1 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" value="{{ request.query_params['url'] if request and request.query_params and 'url' in request.query_params else '' }}">
-        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md">Analyze</button>
-  <svg id="analyzeSpinner" class="ml-2 w-4 h-4 animate-spin hidden" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
-  </svg>
+        <input id="urlInput" type="url" name="url" placeholder="Enter URL (https://…)" required
+               class="flex-1 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+               value="{{ request.query_params['url'] if request and request.query_params and 'url' in request.query_params else '' }}">
+        <button type="submit" id="analyzeBtn"
+                class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md inline-flex items-center gap-2">
+          <span id="analyzeBtnText">Analyze</span>
+          <svg id="analyzeSpinner" class="w-4 h-4 animate-spin hidden" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+          </svg>
+        </button>
       </form>
-<script>
-  (function () {
-    const form = document.getElementById('mainAnalyzeForm');
-    const btn = document.getElementById('analyzeBtn');
-    const text = document.getElementById('analyzeBtnText');
-    const spinner = document.getElementById('analyzeSpinner');
-    if (!form || !btn || !text || !spinner) return;
+      <script>
+        (function () {
+          const form = document.getElementById('mainAnalyzeForm');
+          const btn = document.getElementById('analyzeBtn');
+          const text = document.getElementById('analyzeBtnText');
+          const spinner = document.getElementById('analyzeSpinner');
+          if (!form || !btn || !text || !spinner) return;
 
-    form.addEventListener('submit', function () {
-      btn.disabled = true;
-      btn.classList.add('opacity-75', 'cursor-not-allowed');
-      spinner.classList.remove('hidden');          // show the small spinner
-      text.textContent = 'Analyzing…';            // change button text
-      text.classList.add('animate-pulse');        // subtle effect on the text
-    });
-  })();
-</script>
-
+          form.addEventListener('submit', function () {
+            btn.disabled = true;
+            btn.classList.add('opacity-75', 'cursor-not-allowed');
+            spinner.classList.remove('hidden');     // show spinner
+            text.textContent = 'Analyzing…';        // change button text
+          });
+        })();
+      </script>
     </div>
   </div>
-{% if result and result.amp_url %}
-  <a
-    href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
-    target="_blank"
-    class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100"
-  >
-    AMP vs Non-AMP
-  </a>
-{% endif %}
+
+  {% if result and result.amp_url %}
+    <a href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
+       target="_blank" rel="noopener"
+       class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 inline-block">
+      AMP vs Non-AMP
+    </a>
+  {% endif %}
 
   {% if result and result.is_amp and result.amp_url %}
   <!-- AMP Controls -->
@@ -52,28 +55,19 @@
       <span class="text-sm text-slate-600">Variant:</span>
       <select id="variantSelect" class="border rounded-md px-2 py-1 text-sm">
         <option value="{{ result.url }}">Canonical</option>
-        <option value="{{ result.amp_url }}" {% if result.url == result.amp_url %}{% else %}{% endif %}>AMP</option>
+        <option value="{{ result.amp_url }}">AMP</option>
       </select>
       <button id="loadVariantBtn" class="text-sm bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md">Load Variant</button>
       <span class="text-slate-500 text-sm">Quick compare:</span>
       <button id="compareAmpBtn" class="text-sm bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-md">Open AMP & Canonical</button>
     </div>
-{% if result and result.amp_url %}
-  <a
-    href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
-    target="_blank" rel="noopener"
-    class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100"
-  >
-    AMP vs Non-AMP
-  </a>
 
-  {# Optional: prefetch to make external pages pop instantly #}
-  <link rel="prefetch" href="{{ result.url }}">
-  <link rel="prefetch" href="{{ result.amp_url }}">
-  <link rel="prefetch" href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}">
-{% endif %}
+    {# Optional: prefetch to make external pages pop instantly #}
+    <link rel="prefetch" href="{{ result.url }}">
+    <link rel="prefetch" href="{{ result.amp_url }}">
+    <link rel="prefetch" href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}">
 
-    <div class="text-xs text-slate-500">Tip: use the dropdown to re-run the analysis for AMP vs non‑AMP. The compare button opens both reports in new tabs.</div>
+    <div class="text-xs text-slate-500">Tip: use the dropdown to re-run the analysis for AMP vs non-AMP. The compare button opens both reports in new tabs.</div>
   </div>
   <form id="ampFormCanonical" action="/analyze" method="post" target="_blank" class="hidden"><input type="hidden" name="url" value="{{ result.url }}"></form>
   <form id="ampFormAmp" action="/analyze" method="post" target="_blank" class="hidden"><input type="hidden" name="url" value="{{ result.amp_url }}"></form>
@@ -122,7 +116,6 @@
   {% endmacro %}
 
   {% if result %}
-    {# normalize shapes to avoid iterating builtins #}
     {% set open_graph = result.open_graph if result.open_graph is mapping else {} %}
     {% set twitter = result.twitter_card if result.twitter_card is mapping else {} %}
     {% set headings = result.headings if result.headings is mapping else {
@@ -143,7 +136,6 @@
     {% set ps_desktop_metrics = (result.pagespeed.desktop.metrics if result.pagespeed and result.pagespeed.desktop and result.pagespeed.desktop.metrics is mapping else {}) %}
     {% set rendered_matrix = (result.rendered_diff.matrix if result.rendered_diff and result.rendered_diff.matrix is iterable else []) %}
 
-    {# ---------- topline cards ---------- #}
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       <div class="bg-white rounded-lg shadow border p-4">
         <div class="text-slate-500 text-sm">Status</div>
@@ -171,17 +163,18 @@
 
     <!-- Actions -->
     <div class="flex flex-wrap items-center gap-2">
-      <a href="{{ result.url }}" target="_blank" class="inline-flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-md hover:bg-slate-900">
+      <a href="{{ result.url }}" target="_blank" rel="noopener"
+         class="inline-flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-md hover:bg-slate-900">
         <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M12.293 2.293a1 1 0 011.414 0l4 4a1 1 0 01-1.414 1.414L14 5.414V13a1 1 0 11-2 0V5.414L9.707 7.707A1 1 0 018.293 6.293l4-4z"/><path d="M3 9a1 1 0 011-1h3a1 1 0 110 2H5v6h10v-2a1 1 0 112 0v3a1 1 0 01-1 1H4a1 1 0 01-1-1V9z"/></svg>
         Open Page
       </a>
-      <button onclick="window.print()" class="inline-flex items-center gap-2 bg-white border px-3 py-2 rounded-md hover:bg-slate-50">
+      <button onclick="window.print()"
+              class="inline-flex items-center gap-2 bg-white border px-3 py-2 rounded-md hover:bg-slate-50">
         <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M6 2a2 2 0 00-2 2v2h12V4a2 2 0 00-2-2H6z"/><path d="M4 8a2 2 0 00-2 2v3h4v3h8v-3h4v-3a2 2 0 01-2-2H4zm3 5h6v2H7v-2z"/></svg>
         Download as PDF
       </button>
     </div>
 
-    <!-- Page Overview -->
     {% call section('Page Overview', true) %}
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
@@ -204,7 +197,6 @@
       </div>
     {% endcall %}
 
-    <!-- SEO Meta -->
     {% call section('SEO Meta', true) %}
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div class="space-y-2">
@@ -247,7 +239,6 @@
       {% endif %}
     {% endcall %}
 
-    <!-- Content Structure -->
     {% call section('Content Structure', true) %}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="bg-slate-50 rounded-md p-4 border">
@@ -282,7 +273,6 @@
       </div>
     {% endcall %}
 
-    <!-- Links -->
     {% call section('Links', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div>
@@ -290,7 +280,7 @@
           <details>
             <summary class="cursor-pointer text-sm">Show list</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in (result.internal_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+              {% for u in (result.internal_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></li>{% endfor %}
             </ul>
           </details>
         </div>
@@ -299,7 +289,7 @@
           <details>
             <summary class="cursor-pointer text-sm">Show list</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in (result.external_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+              {% for u in (result.external_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></li>{% endfor %}
             </ul>
           </details>
         </div>
@@ -308,7 +298,7 @@
           <details>
             <summary class="cursor-pointer text-sm">Show list</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in (result.nofollow_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
+              {% for u in (result.nofollow_links or []) %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank" rel="noopener">{{ u }}</a></li>{% endfor %}
             </ul>
           </details>
         </div>
@@ -323,7 +313,7 @@
                 <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">URL</th><th class="py-1 pr-3">Status</th><th class="py-1">Redirects</th></tr></thead>
                 <tbody>
                   {% for row in link_checks_internal %}
-                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
+                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank" rel="noopener">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
                   {% else %}
                     <tr><td colspan="3" class="py-2 text-slate-400">No sample</td></tr>
                   {% endfor %}
@@ -338,7 +328,7 @@
                 <thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">URL</th><th class="py-1 pr-3">Status</th><th class="py-1">Redirects</th></tr></thead>
                 <tbody>
                   {% for row in link_checks_external %}
-                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
+                    <tr class="border-t"><td class="py-1 pr-3 max-w-[420px] truncate"><a class="text-blue-700 hover:underline" href="{{ row.final_url or row.url }}" target="_blank" rel="noopener">{{ row.url }}</a></td><td class="py-1 pr-3">{{ row.status or row.error or '—' }}</td><td class="py-1">{{ row.redirects or 0 }}</td></tr>
                   {% else %}
                     <tr><td colspan="3" class="py-2 text-slate-400">No sample</td></tr>
                   {% endfor %}
@@ -350,7 +340,6 @@
       {% endif %}
     {% endcall %}
 
-    <!-- Media -->
     {% call section('Media (Images)', false) %}
       <div class="flex flex-wrap gap-2 mb-3">
         {{ badge((result.checks.alt_coverage.ok if result.checks else none), 'Alt Coverage ' ~ (result.checks.alt_coverage.percent ~ '%' if result.checks else '')) }}
@@ -359,12 +348,11 @@
       <details>
         <summary class="cursor-pointer text-sm font-medium">Images missing alt ({{ images_missing_alt|length }})</summary>
         <ul class="mt-2 space-y-1 list-disc list-inside">
-          {% for im in images_missing_alt %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ im.src }}" target="_blank">{{ im.src }}</a></li>{% else %}<li class="text-slate-400">None 🎉</li>{% endfor %}
+          {% for im in images_missing_alt %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ im.src }}" target="_blank" rel="noopener">{{ im.src }}</a></li>{% else %}<li class="text-slate-400">None 🎉</li>{% endfor %}
         </ul>
       </details>
     {% endcall %}
 
-    <!-- Structured Data -->
     {% call section('Structured Data', false) %}
       <div class="flex flex-wrap gap-2 mb-4">
         {{ pill('JSON-LD: ' ~ ((result.json_ld or [])|length), 'emerald') }}
@@ -403,7 +391,6 @@
       {% endif %}
     {% endcall %}
 
-    <!-- Indexing & Crawling -->
     {% call section('Indexing & Crawling', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="bg-white border rounded-md p-4">
@@ -439,7 +426,6 @@
       </div>
     {% endcall %}
 
-    <!-- Performance -->
     {% call section('Performance', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div class="bg-white border rounded-md p-4">
@@ -475,7 +461,7 @@
                 <div class="mt-1">{{ result.pagespeed.message }}</div>
               {% endif %}
               <ul class="list-disc list-inside mt-2 text-slate-500">
-                <li>Set a PageSpeed API key on the server (e.g., <code>GOOGLE_PSI_API_KEY</code>).</li>
+                <li>Set a PageSpeed API key on the server (e.g., <code>PAGESPEED_API_KEY</code>).</li>
                 <li>Enable the feature in your config and re-run analysis.</li>
               </ul>
             </div>
@@ -490,7 +476,6 @@
       </div>
     {% endcall %}
 
-    <!-- Rendered vs Static Comparison -->
     {% call section('Rendered vs Static Comparison', false) %}
       {% if rendered_matrix %}
         <div class="overflow-x-auto">
@@ -511,33 +496,20 @@
           </table>
         </div>
       {% else %}
-        <div class="text-sm text-slate-500">Rendered DOM check skipped or failed.
-        {% set err = (result.rendered_diff.error if result.rendered_diff and result.rendered_diff.error else '') %}
-        <div class="mt-2 text-xs text-slate-600">Possible reasons: Playwright/Chromium not installed, sandbox blocked, timeout, or CSP blocking resources.</div>
-        {% if err %}<div class="text-xs text-red-600 mt-1">{{ err }}</div>{% endif %}
-        <ul class="list-disc list-inside mt-2 text-xs text-slate-600">
-          {% set hints = [
-            'Install Playwright browsers on the server (e.g., playwright install --with-deps chromium).',
-            'Ensure headless Chromium can run (fonts, libc, shared libs).',
-            'Increase render timeout if your server supports it.'
-          ] %}
-          {% for h in hints %}
-            {% if not err or (h not in err) %}<li>{{ h }}</li>{% endif %}
-          {% endfor %}
-        </ul>
-        {% if err and 'Playwright render skipped/failed' in err %}
-          {# avoid repeating the same line; already shown above #}
-        {% endif %}
-        <ul class="list-disc list-inside mt-2 text-xs text-slate-600">
-          <li>Install Playwright browsers on the server (e.g., <code>playwright install --with-deps chromium</code>).</li>
-          <li>Ensure headless Chromium can run (fonts, libc, shared libs).</li>
-          <li>Increase render timeout if your server supports it.</li>
-        </ul></div>
-        {% if result.rendered_diff and result.rendered_diff.error %}<div class="text-sm text-red-600 mt-2">{{ result.rendered_diff.error }}</div>{% endif %}
+        <div class="text-sm text-slate-500">
+          Rendered DOM check skipped or failed.
+          {% set err = (result.rendered_diff.error if result.rendered_diff and result.rendered_diff.error else '') %}
+          <div class="mt-2 text-xs text-slate-600">Possible reasons: Playwright/Chromium not installed, sandbox blocked, timeout, or CSP blocking resources.</div>
+          {% if err %}<div class="text-xs text-red-600 mt-1">{{ err }}</div>{% endif %}
+          <ul class="list-disc list-inside mt-2 text-xs text-slate-600">
+            <li>Install Playwright browsers on the server (e.g., <code>playwright install --with-deps chromium</code>).</li>
+            <li>Ensure headless Chromium can run (fonts, libc, shared libs).</li>
+            <li>Increase render timeout if your server supports it.</li>
+          </ul>
+        </div>
       {% endif %}
     {% endcall %}
 
-    <!-- Raw Data (for debugging / export) -->
     {% call section('Raw Result (JSON)', false) %}
       <pre class="text-xs bg-slate-900 text-slate-100 rounded-md p-4 overflow-x-auto">{{ result|tojson(indent=2) }}</pre>
     {% endcall %}
