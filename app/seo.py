@@ -37,7 +37,13 @@ STOPWORDS = {
 }
 
 # If you want to hardcode, set PSI_API_KEY = "YOUR_KEY". Otherwise use env var.
-PSI_API_KEY = os.getenv("PAGESPEED_API_KEY", "").strip() or None
+PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
+
+def get_pagespeed_data(target_url: str):
+    if not PAGESPEED_API_KEY:
+        raise RuntimeError("PAGESPEED_API_KEY is not set in environment")
+
+    url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={target_url}&key={PAGESPEED_API_KEY}"
 
 # ======================================================================================
 # HTTP helpers
