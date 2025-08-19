@@ -10,6 +10,7 @@ import string
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from xml.etree import ElementTree as ET
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -22,18 +23,19 @@ FAST_MODE_DEFAULT = os.getenv("FAST_MODE_DEFAULT", "1") == "1"
 
 # Page fetch timeouts (seconds)
 HTTP_TIMEOUT_MAIN = float(os.getenv("HTTP_TIMEOUT_MAIN", "10"))   # main page GET
-HTTP_TIMEOUT_HEAD = float(os.getenv("HTTP_TIMEOUT_HEAD", "5"))    # link HEADs
+HTTP_TIMEOUT_HEAD = float(os.getenv("HTTP_TIMEOUT_HEAD", "5"))    # link/asset HEADs
 HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
 
 # Concurrency & sampling
 HEAD_MAX_WORKERS = int(os.getenv("HEAD_MAX_WORKERS", "16"))
 HEAD_SAMPLE_INTERNAL = int(os.getenv("HEAD_SAMPLE_INTERNAL", "4"))
 HEAD_SAMPLE_EXTERNAL = int(os.getenv("HEAD_SAMPLE_EXTERNAL", "4"))
+ASSET_SAMPLE_PER_TYPE = int(os.getenv("ASSET_SAMPLE_PER_TYPE", "10"))
 
 # PSI (PageSpeed) control
 ENABLE_PSI = os.getenv("ENABLE_PSI", "1") == "1"
 PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
-# ✅ NEW: include PSI inside fast mode, and keep it quick
+# Include PSI inside fast mode and keep it quick
 PSI_IN_FAST = os.getenv("PSI_IN_FAST", "1") == "1"             # run PSI even in fast mode
 PSI_STRATEGY_FAST = os.getenv("PSI_STRATEGY_FAST", "mobile")   # mobile|desktop|both
 PSI_TIMEOUT = int(os.getenv("PSI_TIMEOUT", "20"))              # per strategy seconds
@@ -55,6 +57,8 @@ herself itself themselves them can will would should could may might must about 
 also am among amongst around because before behind below beneath beside besides between beyond both during each either few
 more most much many nor off over under up down out into than too very via per just so only such own same very
 """.split())
+
+_LANG_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z]{4})?(-[a-zA-Z]{2}|\d{3})?$")  # loose BCP-47-ish
 
 # ---------- HTTP Session (pooled) ----------
 _SESSION: requests.Session | None = None
@@ -171,6 +175,30 @@ def _hreflang_links(soup: BeautifulSoup, base: str) -> List[Dict[str, str]]:
             })
     return out
 
+def _validate_hreflang(hreflang: List[Dict[str, str]], base_host: str) -> Dict[str, Any]:
+    errors = []
+    seen = {}
+    x_default_count = 0
+    for row in hreflang:
+        hl = (row.get("hreflang") or "").strip()
+        href = (row.get("href") or "").strip()
+        if not hl or not href:
+            errors.append({"type": "missing_values", "item": row}); continue
+        if hl.lower() == "x-default":
+            x_default_count += 1
+        elif not _LANG_RE.match(hl):
+            errors.append({"type": "invalid_code", "code": hl, "href": href})
+        host = urlparse(href).netloc.lower()
+        if host and base_host and host != base_host:
+            errors.append({"type": "cross_host", "code": hl, "href": href, "host": host})
+        key = (hl.lower(), href)
+        if key in seen:
+            errors.append({"type": "duplicate", "code": hl, "href": href})
+        seen[key] = True
+    if x_default_count > 1:
+        errors.append({"type": "multiple_x_default", "count": x_default_count})
+    return {"errors": errors, "ok": len(errors) == 0}
+
 def _extract_links(soup: BeautifulSoup, base: str) -> Tuple[List[str], List[str], List[str]]:
     host = urlparse(base).netloc.lower()
     internal, external, nofollow = [], [], []
@@ -196,7 +224,13 @@ def _head_one(url: str) -> Dict[str, Any]:
     s = _get_session()
     try:
         r = s.head(url, allow_redirects=True, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
-        return {"url": url, "final_url": r.url, "status": r.status_code, "redirects": len(r.history)}
+        return {
+            "url": url,
+            "final_url": r.url,
+            "status": r.status_code,
+            "redirects": len(r.history),
+            "headers": dict(r.headers),
+        }
     except Exception as e:
         return {"url": url, "status": None, "redirects": 0, "error": str(e)}
 
@@ -241,7 +275,146 @@ def _robots_and_sitemaps(base: str) -> Dict[str, Any]:
         sitemaps = [{"url": None, "error": f"robots fetch failed: {e}"}]
     return {"robots_url": robots_url, "sitemaps": sitemaps, "blocked_by_robots": None}
 
-# ---------- PageSpeed ----------
+def _fetch_xml(url: str) -> str | None:
+    try:
+        r = _get_session().get(url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
+        if r.status_code == 200 and "xml" in (r.headers.get("Content-Type","").lower()):
+            return r.text
+    except Exception:
+        pass
+    return None
+
+def _parse_sitemap_urls(xml_text: str) -> List[str]:
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        for u in root.findall(".//sm:url/sm:loc", ns):
+            if u.text: out.append(u.text.strip())
+    except Exception:
+        pass
+    return out
+
+def _parse_sitemap_index(xml_text: str) -> List[str]:
+    idx = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        for u in root.findall(".//sm:sitemap/sm:loc", ns):
+            if u.text: idx.append(u.text.strip())
+    except Exception:
+        pass
+    return idx
+
+def _collect_sitemap_sample(sitemap_urls: List[str], cap: int = 500) -> List[str]:
+    collected: List[str] = []
+    for sm in sitemap_urls:
+        xml = _fetch_xml(sm)
+        if not xml: continue
+        urls = _parse_sitemap_urls(xml)
+        if urls:
+            for u in urls:
+                collected.append(u)
+                if len(collected) >= cap: return collected
+        else:
+            # maybe a sitemap index
+            idx = _parse_sitemap_index(xml)
+            for child in idx:
+                x = _fetch_xml(child)
+                if not x: continue
+                for u in _parse_sitemap_urls(x):
+                    collected.append(u)
+                    if len(collected) >= cap: return collected
+    return collected
+
+def _extract_assets(soup: BeautifulSoup, base: str, max_per_type: int = 10) -> Dict[str, List[str]]:
+    css = [urljoin(base, l["href"].strip())
+           for l in soup.find_all("link", rel=lambda v: v and "stylesheet" in v.lower(), href=True)]
+    js = [urljoin(base, s["src"].strip())
+          for s in soup.find_all("script", src=True)]
+    imgs = [urljoin(base, im["src"].strip())
+            for im in soup.find_all("img", src=True)]
+    return {
+        "css": css[:max_per_type],
+        "js": js[:max_per_type],
+        "img": imgs[:max_per_type],
+    }
+
+def _head_many(urls: List[str]) -> List[Dict[str, Any]]:
+    if not urls: return []
+    rows: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(HEAD_MAX_WORKERS, len(urls))) as tp:
+        futs = [tp.submit(_head_one, u) for u in urls]
+        for f in as_completed(futs):
+            rows.append(f.result())
+    return rows
+
+def _audit_assets(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(rows)
+    compressed = 0
+    cacheable = 0
+    big_assets: List[Dict[str, Any]] = []
+    legacy_imgs: List[str] = []
+    for r in rows:
+        if r.get("status") is None:
+            continue
+        h = {k.lower(): v for k, v in (r.get("headers") or {}).items()}
+        cenc = (h.get("content-encoding") or "").lower()
+        cctl = (h.get("cache-control") or "").lower()
+        clen = h.get("content-length")
+        ctype = (h.get("content-type") or "").lower()
+
+        if cenc in ("gzip", "br", "deflate"):
+            compressed += 1
+        if any(tok in cctl for tok in ("max-age", "s-maxage")) and "no-store" not in cctl:
+            cacheable += 1
+
+        try:
+            size = int(clen) if clen is not None else None
+        except Exception:
+            size = None
+        if size and size >= 300_000:  # 300 KB
+            big_assets.append({"url": r.get("final_url") or r.get("url"), "bytes": size})
+
+        if ctype.startswith("image/") and not any(fmt in ctype for fmt in ("webp", "avif")):
+            legacy_imgs.append(r.get("final_url") or r.get("url"))
+
+    return {
+        "total_sampled": total,
+        "compressed_percent": round(100.0 * compressed / total, 1) if total else 0.0,
+        "cacheable_percent": round(100.0 * cacheable / total, 1) if total else 0.0,
+        "big_assets": sorted(big_assets, key=lambda x: x["bytes"], reverse=True)[:10],
+        "legacy_images": legacy_imgs[:10],
+    }
+
+def _mixed_content(assets: Dict[str, List[str]], page_url: str) -> Dict[str, Any]:
+    if not page_url.startswith("https://"):
+        return {"affected": 0, "items": []}
+    flat = assets.get("css", []) + assets.get("js", []) + assets.get("img", [])
+    bad = [u for u in flat if u.startswith("http://")]
+    return {"affected": len(bad), "items": bad[:20]}
+
+def _audit_security_headers(headers: dict) -> Dict[str, Any]:
+    hv = {k.lower(): v for k, v in (headers or {}).items()}
+    report = {
+        "hsts": hv.get("strict-transport-security"),
+        "csp": hv.get("content-security-policy"),
+        "xcto": hv.get("x-content-type-options"),
+        "xfo": hv.get("x-frame-options"),
+        "referrer_policy": hv.get("referrer-policy"),
+        "permissions_policy": hv.get("permissions-policy") or hv.get("feature-policy"),
+    }
+    score = 0
+    score += 1 if report["hsts"] and "max-age" in report["hsts"] else 0
+    score += 1 if report["csp"] else 0
+    score += 1 if report["xcto"] == "nosniff" else 0
+    score += 1 if report["xfo"] in ("DENY", "SAMEORIGIN") else 0
+    score += 1 if report["referrer_policy"] else 0
+    score += 1 if report["permissions_policy"] else 0
+    report["score_6"] = score
+    return report
+
+# ---------- PageSpeed (with CrUX) ----------
 def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     s = _get_session()
@@ -253,6 +426,24 @@ def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
     audits = lr.get("audits", {})
     cat = lr.get("categories", {}).get("performance", {})
     score = cat.get("score")
+
+    def _crux(src: dict | None) -> dict:
+        if not isinstance(src, dict):
+            return {}
+        def p75(key: str):
+            try:
+                return round(src.get("metrics", {}).get(key, {}).get("percentiles", {}).get("p75"), 2)
+            except Exception:
+                return None
+        return {
+            "LCP_p75_ms": p75("LARGEST_CONTENTFUL_PAINT_MS"),
+            "CLS_p75": p75("CUMULATIVE_LAYOUT_SHIFT"),
+            "INP_p75_ms": p75("INTERACTION_TO_NEXT_PAINT"),
+            "source": src.get("overall_category")
+        }
+
+    field_data = _crux(data.get("loadingExperience"))
+    origin_field_data = _crux(data.get("originLoadingExperience"))
 
     def metr(audit_key: str):
         v = audits.get(audit_key, {}).get("numericValue")
@@ -266,7 +457,12 @@ def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
         "Speed Index (ms)": metr("speed-index"),
         "Time To Interactive (ms)": metr("interactive"),
     }
-    return {"score": score and round(score * 100), "metrics": {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}}
+    return {
+        "score": score and round(score * 100),
+        "metrics": {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()},
+        "field_data": field_data,
+        "origin_field_data": origin_field_data,
+    }
 
 def _pagespeed_full(url: str) -> Dict[str, Any]:
     if not (ENABLE_PSI and PAGESPEED_API_KEY):
@@ -283,9 +479,7 @@ def _pagespeed_full(url: str) -> Dict[str, Any]:
     return out
 
 def _pagespeed_fast(url: str) -> Dict[str, Any]:
-    """
-    Faster PSI: chooses strategy via PSI_STRATEGY_FAST and uses shorter timeout.
-    """
+    """Faster PSI: strategy via PSI_STRATEGY_FAST and shorter timeout."""
     if not (ENABLE_PSI and PAGESPEED_API_KEY):
         return {"enabled": False, "message": "PageSpeed disabled or missing API key"}
     strat = PSI_STRATEGY_FAST.lower()
@@ -299,7 +493,7 @@ def _pagespeed_fast(url: str) -> Dict[str, Any]:
             out[strat]["error"] = str(e)
         return out
 
-    # both (still quick; runs sequentially to avoid oversubscription)
+    # both
     try:
         out["mobile"].update(_psi_call(url, "mobile", timeout_sec=PSI_TIMEOUT))
     except Exception as e:
@@ -334,6 +528,7 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "h1": [], "h2": [], "h3": [], "h4": [], "h5": [], "h6": [],
         "keyword_density_top": [],
         "hreflang": [],
+        "hreflang_validation": {"ok": True, "errors": []},
         "images_missing_alt": [],
         "internal_links": [],
         "external_links": [],
@@ -343,6 +538,11 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "performance": {},
         "pagespeed": {"enabled": False},
         "crawl_checks": {},
+        "sitemap_summary": {},
+        "assets": {"css": [], "js": [], "img": []},
+        "assets_audit": {},
+        "mixed_content": {},
+        "security_headers": {},
         "json_ld": [],
         "microdata": [],
         "rdfa": [],
@@ -371,6 +571,9 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     body = resp.content or b""
     content_len = len(body)
     soup = _soup_parse(body, final_url)
+
+    # --- Security headers (from main response) ---
+    security = _audit_security_headers(resp.headers)
 
     # --- Meta basics ---
     title = (soup.title.string.strip() if (soup.title and soup.title.string) else None)
@@ -419,9 +622,24 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
 
     # --- robots & sitemaps ---
     crawl = _robots_and_sitemaps(final_url)
+    sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
+    sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
+    # quick orphan candidates = present in sitemap but not linked on this page
+    orphans = [u for u in sitemap_sample if u not in set(internal)]
 
     # --- Link status (concurrent & sampled) ---
     link_checks = _sample_status(internal, external, fast=fast)
+
+    # --- Assets & audits ---
+    assets = _extract_assets(soup, final_url, max_per_type=ASSET_SAMPLE_PER_TYPE)
+    asset_rows = _head_many(assets["css"] + assets["js"] + assets["img"])
+    assets_audit = _audit_assets(asset_rows)
+    mixed = _mixed_content(assets, final_url)
+
+    # --- Hreflang validation ---
+    base_host = urlparse(final_url).netloc.lower()
+    hreflang_list = _hreflang_links(soup, final_url)
+    hreflang_check = _validate_hreflang(hreflang_list, base_host)
 
     # --- Indexability / checks ---
     indexable_ok, indexable_val = _check_indexability(robots_meta, x_robots)
@@ -453,12 +671,11 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "desktop_score": None,
     }
 
-    # --- PageSpeed ---
+    # --- PageSpeed (with CrUX) ---
     if fast:
         ps = _pagespeed_fast(final_url) if PSI_IN_FAST else {"enabled": False, "message": "Skipped (FAST_MODE_DEFAULT)"}
     else:
         ps = _pagespeed_full(final_url)
-
     if ps.get("enabled"):
         perf["mobile_score"] = ps.get("mobile", {}).get("score")
         perf["desktop_score"] = ps.get("desktop", {}).get("score")
@@ -488,7 +705,8 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "twitter_card": tw,
         "h1": heads["h1"], "h2": heads["h2"], "h3": heads["h3"], "h4": heads["h4"], "h5": heads["h5"], "h6": heads["h6"],
         "keyword_density_top": kd,
-        "hreflang": _hreflang_links(soup, final_url),
+        "hreflang": hreflang_list,
+        "hreflang_validation": hreflang_check,
         "images_missing_alt": imgs_missing,
         "internal_links": internal,
         "external_links": external,
@@ -498,6 +716,15 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "performance": perf,
         "pagespeed": ps,
         "crawl_checks": {"sitemaps": crawl.get("sitemaps", []), "blocked_by_robots": crawl.get("blocked_by_robots")},
+        "sitemap_summary": {
+            "sitemaps_found": len(sitemap_urls),
+            "sampled_url_count": len(sitemap_sample),
+            "possible_orphans_sampled": orphans[:50],
+        },
+        "assets": assets,
+        "assets_audit": assets_audit,
+        "mixed_content": mixed,
+        "security_headers": security,
         "json_ld": json_ld,
         "microdata": [],
         "rdfa": [],
