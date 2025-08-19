@@ -7,3 +7,4 @@ beautifulsoup4
 python-multipart
 sqlalchemy
 sqlmodel
+lxml
