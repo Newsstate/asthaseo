@@ -1,38 +1,27 @@
-# Base image
-FROM python:3.11-slim
+# Chromium + system deps already baked in
+FROM mcr.microsoft.com/playwright/python:v1.47.2-jammy
 
-# Prevent Python from writing .pyc files and buffering stdout/stderr
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Set workdir
 WORKDIR /app
 
-#rendered vs static comparision
-RUN pip install playwright
-RUN playwright install --with-deps chromium
+# Install Python deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# System deps (curl for healthcheck, build tools for lxml)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \ 
-    libxml2-dev libxslt1-dev \ 
-    curl \ 
-    && rm -rf /var/lib/apt/lists/*
+# Copy app
+COPY . /app
 
-# Copy requirements first and install
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \ 
-    && pip install --no-cache-dir gunicorn
-
-# Copy project
-COPY . .
-
-# Expose port
-EXPOSE 8000
-
-# Default envs
+# Runtime env
 ENV TZ=Asia/Kolkata
+ENV ENABLE_RENDERED=1
+# Optional tuning:
+# ENV RENDER_TIMEOUT_MS=60000
+# ENV RENDER_WAIT_UNTIL=networkidle
 
-# Start the app (use $PORT if provided by platform)
+EXPOSE 8000
 ENV PORT=8000
-CMD exec gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${PORT} --workers 2 --timeout 120
+
+# Use 1 worker (SQLite + headless browser plays nicer)
+CMD ["bash","-lc","gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${PORT} --workers 1 --timeout 180"]
+# Or uvicorn:
+# CMD ["bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
