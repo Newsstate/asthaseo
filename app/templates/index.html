@@ -35,6 +35,14 @@
       </script>
     </div>
   </div>
+{% if result.errors and (result.errors|length) %}
+  <div class="bg-amber-50 border border-amber-200 text-amber-900 rounded-md p-3">
+    <div class="font-medium">Heads-up</div>
+    <ul class="list-disc list-inside text-sm">
+      {% for e in result.errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+  </div>
+{% endif %}
 
   {% if result and result.amp_url %}
     <a href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}" target="_blank"
