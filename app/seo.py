@@ -45,14 +45,13 @@ USE_LXML = os.getenv("USE_LXML", "1") == "1"
 
 # ---------- Constants ----------
 # --- add near imports ---
-import re
-import requests
 
 # --- add constants once ---
 _CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
+    USER_AGENT = os.getenv("USER_AGENT", _CHROME_UA)
 )
 
 _BASE_HEADERS = {
@@ -655,42 +654,40 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "rdfa": [],
         "sd_types": {"types": []},
         "errors": [],
-             "notes": {},
+        "notes": {},
     }
 
-# --- Fetch page (hardened to bypass common WAF/bot blocks) ---
-try:
-    t0 = time.perf_counter()
-    resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/")
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-except Exception as e:
-    result["performance"] = {
-        "final_url": url,
-        "http_version": "HTTP/1.1",
-        "redirects": 0,
-        "page_size_bytes": 0,
-        "load_time_ms": None,
-        "https": {"is_https": url.startswith("https"), "ssl_checked": False, "ssl_ok": None},
-        "mobile_score": None,
-        "desktop_score": None,
-    }
-    result["pagespeed"] = {"enabled": False, "message": f"Fetch failed: {e}"}
-    result.setdefault("errors", []).append(f"Fetch failed: {e}")
-    return result
+    # --- Fetch page (hardened to bypass common WAF/bot blocks) ---
+    try:
+        t0 = time.perf_counter()
+        # IMPORTANT: use the original input `url` here
+        resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/")
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    except Exception as e:
+        result["performance"] = {
+            "final_url": url,
+            "http_version": "HTTP/1.1",
+            "redirects": 0,
+            "page_size_bytes": 0,
+            "load_time_ms": None,
+            "https": {"is_https": url.startswith("https"), "ssl_checked": False, "ssl_ok": None},
+            "mobile_score": None,
+            "desktop_score": None,
+        }
+        result["pagespeed"] = {"enabled": False, "message": f"Fetch failed: {e}"}
+        result["errors"].append(f"Fetch failed: {e}")
+        return result
 
-final_url = str(resp.url)
-status = resp.status_code
+    final_url = str(resp.url)                # after redirects
+    status = resp.status_code
+    body_bytes = html_text.encode(resp.encoding or "utf-8", errors="ignore")
+    content_len = len(body_bytes)
+    soup = _soup_parse(body_bytes, final_url)
 
-# Turn the HTML text into bytes for your existing parser utilities
-body_bytes = html_text.encode(resp.encoding or "utf-8", errors="ignore")
-content_len = len(body_bytes)
-soup = _soup_parse(body_bytes, final_url)
-
-# Surface fetch details/warnings to the UI
-result["notes"] = {"fetch": fetch_meta}
-if "warning" in fetch_meta:
-    result.setdefault("errors", []).append(fetch_meta["warning"])
-
+    # Surface fetch details/warnings to the UI
+    result["notes"] = {"fetch": fetch_meta}
+    if "warning" in fetch_meta:
+        result["errors"].append(fetch_meta["warning"])
 
     # --- Security headers (from main response) ---
     security = _audit_security_headers(resp.headers)
@@ -744,8 +741,7 @@ if "warning" in fetch_meta:
     crawl = _robots_and_sitemaps(final_url)
     sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
     sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
-    # quick orphan candidates = present in sitemap but not linked on this page
-    orphans = [u for u in sitemap_sample if u not in set(internal)]
+    orphans = [u for u in sitemap_sample if u not in set(internal)]  # quick orphan candidates
 
     # --- Link status (concurrent & sampled) ---
     link_checks = _sample_status(internal, external, fast=fast)
@@ -848,6 +844,7 @@ if "warning" in fetch_meta:
         "json_ld": json_ld,
         "microdata": [],
         "rdfa": [],
-        "sd_types": {"types": list({item.get("@type") for item in json_ld if isinstance(item, dict) and item.get("@type")}) if json_ld else []},
+        "sd_types": {"types": list({item.get("@type") for item in json_ld
+                                    if isinstance(item, dict) and item.get("@type")}) if json_ld else []},
     })
     return result
