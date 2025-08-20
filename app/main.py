@@ -4,30 +4,34 @@ from __future__ import annotations
 import os
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request, Form, HTTPException, Query, Response
+from fastapi import FastAPI, Request, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-# ---------- Paths & App ----------
-FILE_DIR = Path(__file__).parent          # app/
-PROJECT_ROOT = FILE_DIR.parent            # repo root (where /static lives)
 
-app = FastAPI(title="SEO & Performance Dashboard", version="1.0.0")
+# ---------- Paths & App ----------
+FILE_DIR = Path(__file__).parent          # /app
+PROJECT_ROOT = FILE_DIR.parent            # repo root
+
+app = FastAPI(title="SEO & Performance Dashboard", version="1.1.0")
 logger = logging.getLogger("uvicorn.error")
+
 
 # ---------- Static ----------
 STATIC_DIR = PROJECT_ROOT / "static"
-STATIC_DIR.mkdir(parents=True, exist_ok=True)  # avoid mount errors if folder missing
+STATIC_DIR.mkdir(parents=True, exist_ok=True)  # avoid mount errors if missing
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 
 # ---------- Templates ----------
 templates = Jinja2Templates(directory=str(FILE_DIR / "templates"))
+
 
 # ---------- Database (optional) ----------
 init_db = None
@@ -35,6 +39,7 @@ try:
     from .db import init_db  # type: ignore
 except Exception as e:
     logger.warning("DB module not found or failed to import: %r", e)
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -54,10 +59,11 @@ async def on_startup():
     if not os.getenv("PAGESPEED_API_KEY"):
         logger.warning("PAGESPEED_API_KEY not set; PageSpeed features may be disabled")
 
+
 # ---------- Import analyzer (sync function) ----------
-def _fallback_pagespeed(url: str, fast: bool | None = None) -> dict:
-    # Safe placeholder in case seo.py fails to import
-    return {"ok": False, "message": "seo.get_pagespeed_data not found", "url": url, "pagespeed": {"enabled": False}}
+def _fallback_pagespeed(url: str, fast: Optional[bool] = None) -> dict:
+    # Safe placeholder if seo.py fails to import; keep signature compatible
+    return {"ok": False, "message": "seo.get_pagespeed_data not found", "url": url, "fast": fast}
 
 get_pagespeed_data = _fallback_pagespeed
 try:
@@ -65,6 +71,7 @@ try:
     get_pagespeed_data = _real_get_pagespeed_data
 except Exception as e:
     logger.warning("seo.get_pagespeed_data unavailable, using fallback: %r", e)
+
 
 # ---------- Helpers ----------
 def _normalize_url(u: str) -> str:
@@ -76,29 +83,13 @@ def _normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-def _to_boolish(v: Optional[str | int | bool]) -> Optional[bool]:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return None
 
 # ---------- Routes ----------
-@app.head("/")
-async def head_root():
-    # Silence HEAD / 405 noise in logs
-    return Response(status_code=200)
-
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, fast: Optional[int] = Query(None)):
-    # Let query ?fast=1/0 preselect the mode in the UI
-    scan_mode = "auto" if fast is None else ("fast" if bool(fast) else "deep")
-    return templates.TemplateResponse("index.html", {"request": request, "result": None, "scan_mode": scan_mode})
+async def index(request: Request):
+    # Render the main dashboard with empty result
+    return templates.TemplateResponse("index.html", {"request": request, "result": None, "scan_mode": "auto"})
+
 
 # Accepts HTML form posts (action points here)
 @app.post("/analyze", name="analyze_form", response_class=HTMLResponse)
@@ -108,24 +99,46 @@ async def analyze_form(
     url: Optional[str] = Form(None),
     target_url: Optional[str] = Form(None),
     website: Optional[str] = Form(None),
-    fast: Optional[str] = Form(None),  # "1" or "0" (from the select)
+    fast: Optional[str] = Form(None),   # "1" for fast, "0" for deep, None => default
 ):
     target = _normalize_url(url or target_url or website or "")
     if not target:
         raise HTTPException(status_code=400, detail="Missing URL (expected 'url', 'target_url', or 'website')")
 
-    fast_flag = _to_boolish(fast)  # None => use FAST_MODE_DEFAULT in seo.py
-    data = await run_in_threadpool(get_pagespeed_data, target, fast_flag)
-    scan_mode = "fast" if (fast_flag is True) else ("deep" if (fast_flag is False) else "auto")
+    fast_bool: Optional[bool] = None if fast is None else (fast == "1")
 
-    # Render same page with result data + mode for a small badge
-    return templates.TemplateResponse("index.html", {"request": request, "result": data, "scan_mode": scan_mode})
+    try:
+        data = await run_in_threadpool(get_pagespeed_data, target, fast_bool)
+    except Exception as e:
+        # Render page with an inline error payload so UI stays usable
+        data = {"url": target, "errors": [str(e)], "pagespeed": {"enabled": False, "message": str(e)}}
 
-# GET /analyze -> redirect home (avoid 404 when someone hits it directly)
-@app.get("/analyze")
-@app.get("/analyze/")
-async def analyze_get_redirect():
-    return RedirectResponse(url="/", status_code=307)
+    mode_label = "fast" if fast_bool is True else ("deep" if fast_bool is False else "auto")
+    return templates.TemplateResponse("index.html", {"request": request, "result": data, "scan_mode": mode_label})
+
+
+# Optional: GET /analyze?url=...&fast=1
+@app.get("/analyze", response_class=HTMLResponse)
+@app.get("/analyze/", response_class=HTMLResponse)
+async def analyze_get(
+    request: Request,
+    url: Optional[str] = Query(None),
+    fast: Optional[int] = Query(None, description="1=fast, 0=deep"),
+):
+    if not url:
+        return RedirectResponse(url="/", status_code=307)
+
+    target = _normalize_url(url)
+    fast_bool: Optional[bool] = None if fast is None else (fast == 1)
+
+    try:
+        data = await run_in_threadpool(get_pagespeed_data, target, fast_bool)
+    except Exception as e:
+        data = {"url": target, "errors": [str(e)], "pagespeed": {"enabled": False, "message": str(e)}}
+
+    mode_label = "fast" if fast_bool is True else ("deep" if fast_bool is False else "auto")
+    return templates.TemplateResponse("index.html", {"request": request, "result": data, "scan_mode": mode_label})
+
 
 # Handle common typo '/analyz' (no 'e')
 @app.get("/analyz")
@@ -146,7 +159,8 @@ async def analyz_post_redirect(url: Optional[str] = Form(None)):
     </body></html>"""
     return HTMLResponse(html)
 
-# JSON API variants
+
+# JSON API variant
 class AnalyzeRequest(BaseModel):
     url: str
     fast: Optional[bool] = None
@@ -157,21 +171,15 @@ async def analyze_api(payload: AnalyzeRequest):
     if not target:
         raise HTTPException(status_code=400, detail="Invalid URL")
     data = await run_in_threadpool(get_pagespeed_data, target, payload.fast)
-    return {"url": target, "result": data, "mode": ("fast" if payload.fast else "deep" if payload.fast is False else "auto")}
+    return {"url": target, "result": data, "fast": payload.fast}
 
-@app.get("/api/analyze", response_class=JSONResponse)
-async def analyze_api_get(url: str = Query(...), fast: Optional[int] = Query(None)):
-    target = _normalize_url(url)
-    fast_flag = None if fast is None else bool(fast)
-    data = await run_in_threadpool(get_pagespeed_data, target, fast_flag)
-    return {"url": target, "result": data, "mode": ("fast" if fast_flag else "deep" if fast_flag is False else "auto")}
 
-# --- AMP vs Non-AMP compare page (renders templates/amp_compare.html) ---
+# --- AMP vs Non-AMP compare page (renders app/templates/amp_compare.html) ---
 @app.get("/amp-compare", response_class=HTMLResponse, name="amp_compare")
-async def amp_compare(request: Request, url: str = Query(...)):
+async def amp_compare(request: Request, url: str = Query(..., description="Canonical or AMP URL to compare")):
     """
     Compare key SEO/performance/meta items between a canonical URL and its AMP variant.
-    We use fast=True here so it loads quickly.
+    Uses 'fast' mode for responsiveness.
     """
     def fmt(v):
         if v is None:
@@ -180,17 +188,15 @@ async def amp_compare(request: Request, url: str = Query(...)):
             return " | ".join([str(x) for x in v[:5]])
         return str(v)
 
-    def sget(d, *keys, default=None):
-        cur = d
+    def sget(d: Dict[str, Any], *keys: str, default=None):
+        cur: Any = d
         for k in keys:
-            if cur is None:
+            if not isinstance(cur, dict):
                 return default
-            if isinstance(cur, dict):
-                cur = cur.get(k)
-            else:
-                return default
+            cur = cur.get(k)
         return cur if cur is not None else default
 
+    # Fetch the initial URL (FAST)
     try:
         a = await run_in_threadpool(get_pagespeed_data, _normalize_url(url), True)
     except Exception as e:
@@ -203,6 +209,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
     amp_url = a.get("amp_url")
 
     if a.get("is_amp"):
+        # If input is already AMP, use canonical as non-AMP
         non_amp_url = a.get("canonical") or non_amp_url
         amp_url = non_amp_url if non_amp_url == url else url
 
@@ -212,6 +219,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
             {"request": request, "url": non_amp_url, "amp_url": None, "rows": [], "error": "No AMP version found (no <link rel=\"amphtml\">)."}
         )
 
+    # Fetch AMP page (FAST)
     try:
         b = await run_in_threadpool(get_pagespeed_data, _normalize_url(amp_url), True)
     except Exception as e:
@@ -220,6 +228,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
             {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": [], "error": f"AMP fetch failed: {e}"}
         )
 
+    # Build comparison rows
     rows = []
     def add_row(label, val_a, val_b):
         sa, sb = fmt(val_a), fmt(val_b)
@@ -232,6 +241,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
     add_row("Robots Meta", a.get("robots_meta"), b.get("robots_meta"))
     add_row("H1", sget(a, "h1", default=[]), sget(b, "h1", default=[]))
 
+    # Performance
     add_row("Load Time (ms)",
             sget(a, "performance", "load_time_ms", default=a.get("load_time_ms")),
             sget(b, "performance", "load_time_ms", default=b.get("load_time_ms")))
@@ -245,6 +255,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
             sget(a, "performance", "desktop_score"),
             sget(b, "performance", "desktop_score"))
 
+    # Social meta
     add_row("OG Image",
             sget(a, "open_graph", "og:image"),
             sget(b, "open_graph", "og:image"))
@@ -252,6 +263,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
             sget(a, "twitter_card", "twitter:card"),
             sget(b, "twitter_card", "twitter:card"))
 
+    # Indexability
     add_row("Indexable",
             sget(a, "checks", "indexable", "value"),
             sget(b, "checks", "indexable", "value"))
@@ -260,6 +272,7 @@ async def amp_compare(request: Request, url: str = Query(...)):
         "amp_compare.html",
         {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": rows, "error": None}
     )
+
 
 @app.get("/healthz", response_class=JSONResponse)
 async def healthz():
