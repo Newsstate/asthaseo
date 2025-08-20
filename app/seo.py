@@ -351,13 +351,23 @@ def _sample_status(internal: List[str], external: List[str], fast: bool) -> Dict
     return {"internal": rows_int, "external": rows_ext}
 
 
-def _robots_and_sitemaps(base: str) -> Dict[str, Any]:
-    robots_url = f"{urlparse(base).scheme}://{urlparse(base).netloc}/robots.txt"
+from urllib import robotparser
+
+def _robots_and_sitemaps(base: str, target_url: str, ua: str = USER_AGENT) -> Dict[str, Any]:
+    """
+    Fetch robots.txt once using our session + UA, parse it locally, and check whether
+    `target_url` is blocked for the provided UA (and also for '*').
+    """
+    parsed = urlparse(base)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     s = _get_session()
+
     sitemaps: List[Dict[str, Any]] = []
+    robots_txt: str | None = None
     try:
-        r = s.get(robots_url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
+        r = s.get(robots_url, headers={"User-Agent": ua}, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
         if r.status_code == 200 and r.text:
+            robots_txt = r.text
             for line in r.text.splitlines():
                 if line.lower().startswith("sitemap:"):
                     sm_url = line.split(":", 1)[1].strip()
@@ -366,9 +376,40 @@ def _robots_and_sitemaps(base: str) -> Dict[str, Any]:
                         sitemaps.append({"url": sm_url, "status": h.status_code})
                     except Exception as e:
                         sitemaps.append({"url": sm_url, "error": str(e)})
+        else:
+            # No robots or not readable; standard practice: treat as not blocked
+            robots_txt = None
     except Exception as e:
-        sitemaps = [{"url": None, "error": f"robots fetch failed: {e}"}]
-    return {"robots_url": robots_url, "sitemaps": sitemaps, "blocked_by_robots": None}
+        # Network issues: treat as not blocked but surface the error
+        return {
+            "robots_url": robots_url,
+            "sitemaps": sitemaps or [{"url": None, "error": f"robots fetch failed: {e}"}],
+            "blocked_by_robots": None,
+            "robots_eval": {"ua_checked": ua, "note": "robots fetch failed"},
+        }
+
+    # Evaluate rules locally
+    blocked: bool | None = None
+    details: Dict[str, Any] = {"ua_checked": ua}
+    if robots_txt:
+        rp = robotparser.RobotFileParser()
+        rp.parse(robots_txt.splitlines())
+        try:
+            can_ua = rp.can_fetch(ua, target_url)
+            can_star = rp.can_fetch("*", target_url)
+            blocked = not (can_ua or can_star)
+            details.update({"can_fetch_ua": can_ua, "can_fetch_star": can_star})
+        except Exception as e:
+            details.update({"error": f"robotparser failed: {e}"})
+            blocked = None
+
+    return {
+        "robots_url": robots_url,
+        "sitemaps": sitemaps,
+        "blocked_by_robots": blocked,
+        "robots_eval": details,
+    }
+
 
 
 def _fetch_xml(url: str) -> str | None:
@@ -830,10 +871,13 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
 
     kd = _get_text_density(soup)
 
-    crawl = _robots_and_sitemaps(final_url)
-    sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
-    sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
-    orphans = [u for u in sitemap_sample if u not in set(internal)]
+   # --- robots & sitemaps (UA-aware) ---
+ua_for_robots = (fetch_meta or {}).get("ua", USER_AGENT)
+crawl = _robots_and_sitemaps(final_url, final_url, ua=ua_for_robots)
+sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
+sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
+orphans = [u for u in sitemap_sample if u not in set(internal)]
+
 
     link_checks = _sample_status(internal, external, fast=fast)
 
@@ -949,12 +993,13 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "checks": checks,
         "performance": perf,
         "pagespeed": ps,
-        "crawl_checks": {"sitemaps": crawl.get("sitemaps", []), "blocked_by_robots": crawl.get("blocked_by_robots")},
-        "sitemap_summary": {
-            "sitemaps_found": len(sitemap_urls),
-            "sampled_url_count": len(sitemap_sample),
-            "possible_orphans_sampled": orphans[:50],
-        },
+      "crawl_checks": {
+        "sitemaps": crawl.get("sitemaps", []),
+        "blocked_by_robots": crawl.get("blocked_by_robots"),
+        "robots_url": crawl.get("robots_url"),
+        "robots_ua": crawl.get("robots_eval", {}).get("ua_checked"),
+        "robots_eval": crawl.get("robots_eval", {}),
+    },
         "assets": assets,
         "assets_audit": assets_audit,
         "mixed_content": mixed,
