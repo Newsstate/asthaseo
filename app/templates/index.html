@@ -2,15 +2,39 @@
 {% block content %}
 
 <div class="max-w-7xl mx-auto p-6 space-y-6">
+
   <!-- Header / Form -->
   <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-    <h1 class="text-2xl sm:text-3xl font-bold">SEO & Performance Dashboard</h1>
+    <div class="flex items-center gap-2">
+      <h1 class="text-2xl sm:text-3xl font-bold">SEO &amp; Performance Dashboard</h1>
+      {% if scan_mode %}
+        <span class="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium
+          {% if scan_mode == 'deep' %} bg-indigo-100 text-indigo-800 border-indigo-200
+          {% elif scan_mode == 'fast' %} bg-emerald-100 text-emerald-800 border-emerald-200
+          {% else %} bg-slate-100 text-slate-800 border-slate-200 {% endif %}">
+          Mode: {{ 'Deep' if scan_mode == 'deep' else 'Quick' if scan_mode == 'fast' else 'Auto' }}
+        </span>
+      {% endif %}
+    </div>
 
     <div class="flex-1 sm:max-w-xl">
       <form id="mainAnalyzeForm" action="/analyze" method="post" class="flex gap-2 w-full">
-        <input id="urlInput" type="url" name="url" placeholder="Enter URL (https://…)" required
-               class="flex-1 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-               value="{{ request.query_params['url'] if request and request.query_params and 'url' in request.query_params else '' }}">
+        <input
+          id="urlInput"
+          type="url"
+          name="url"
+          placeholder="Enter URL (https://…)"
+          required
+          class="flex-1 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          value="{{ request.query_params['url'] if request and request.query_params and 'url' in request.query_params else '' }}"
+        >
+
+        <!-- Scan mode (Fast or Deep) -->
+        <select name="fast" class="border rounded-md px-2 py-2 text-sm">
+          <option value="1" {% if scan_mode in ['auto','fast'] %}selected{% endif %}>⚡ Quick (skip PSI)</option>
+          <option value="0" {% if scan_mode == 'deep' %}selected{% endif %}>Deep (PageSpeed on)</option>
+        </select>
+
         <button id="analyzeBtn" type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md inline-flex items-center gap-2">
           <span id="analyzeBtnText">Analyze</span>
           <svg id="analyzeSpinner" class="w-4 h-4 animate-spin hidden" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -19,17 +43,19 @@
           </svg>
         </button>
       </form>
+
       <script>
         (function () {
           const form = document.getElementById('mainAnalyzeForm');
           const btn = document.getElementById('analyzeBtn');
           const text = document.getElementById('analyzeBtnText');
           const spinner = document.getElementById('analyzeSpinner');
-          if (!form) return;
+          if (!form || !btn || !text || !spinner) return;
           form.addEventListener('submit', function () {
-            if (btn) { btn.disabled = true; btn.classList.add('opacity-75','cursor-not-allowed'); }
-            if (spinner) spinner.classList.remove('hidden');
-            if (text) { text.textContent = 'Analyzing…'; text.classList.add('animate-pulse'); }
+            btn.disabled = true;
+            btn.classList.add('opacity-75', 'cursor-not-allowed');
+            spinner.classList.remove('hidden');
+            text.textContent = 'Analyzing…';
           });
         })();
       </script>
@@ -37,8 +63,11 @@
   </div>
 
   {% if result and result.amp_url %}
-    <a href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}" target="_blank"
-       class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">
+    <a
+      href="{{ request.url_for('amp_compare') }}?url={{ result.url | urlencode }}"
+      target="_blank" rel="noopener"
+      class="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 inline-block"
+    >
       AMP vs Non-AMP
     </a>
   {% endif %}
@@ -73,10 +102,10 @@
   {% endmacro %}
 
   {% if result %}
-    {# normalize shapes #}
+    {# normalize shapes to avoid iterating builtins #}
     {% set open_graph = result.open_graph if result.open_graph is mapping else {} %}
     {% set twitter = result.twitter_card if result.twitter_card is mapping else {} %}
-    {% set headings = {
+    {% set headings = result.headings if result.headings is mapping else {
       'h1': (result.h1 or []),
       'h2': (result.h2 or []),
       'h3': (result.h3 or []),
@@ -86,20 +115,14 @@
     } %}
     {% set kd = result.keyword_density_top if (result.keyword_density_top is iterable and result.keyword_density_top is not string) else [] %}
     {% set hreflang = result.hreflang if (result.hreflang is iterable and result.hreflang is not string) else [] %}
-    {% set hreflang_validation = result.hreflang_validation if result.hreflang_validation is mapping else {'ok': true, 'errors': []} %}
     {% set images_missing_alt = result.images_missing_alt if (result.images_missing_alt is iterable and result.images_missing_alt is not string) else [] %}
     {% set link_checks_internal = (result.link_checks.internal if result.link_checks and result.link_checks.internal is iterable else []) %}
     {% set link_checks_external = (result.link_checks.external if result.link_checks and result.link_checks.external is iterable else []) %}
     {% set sitemaps = (result.crawl_checks.sitemaps if result.crawl_checks and result.crawl_checks.sitemaps is iterable else []) %}
-    {% set sitemap_summary = result.sitemap_summary if result.sitemap_summary is mapping else {} %}
     {% set ps_mobile_metrics = (result.pagespeed.mobile.metrics if result.pagespeed and result.pagespeed.mobile and result.pagespeed.mobile.metrics is mapping else {}) %}
     {% set ps_desktop_metrics = (result.pagespeed.desktop.metrics if result.pagespeed and result.pagespeed.desktop and result.pagespeed.desktop.metrics is mapping else {}) %}
-    {% set ps_mobile_field = (result.pagespeed.mobile.field_data if result.pagespeed and result.pagespeed.mobile and result.pagespeed.mobile.field_data is mapping else {}) %}
-    {% set ps_desktop_field = (result.pagespeed.desktop.field_data if result.pagespeed and result.pagespeed.desktop and result.pagespeed.desktop.field_data is mapping else {}) %}
-    {% set assets = result.assets if result.assets is mapping else {'css':[], 'js':[], 'img':[]} %}
-    {% set assets_audit = result.assets_audit if result.assets_audit is mapping else {} %}
-    {% set mixed_content = result.mixed_content if result.mixed_content is mapping else {'affected': 0, 'items': []} %}
-    {% set security_headers = result.security_headers if result.security_headers is mapping else {} %}
+    {% set mixed = result.mixed_content if result.mixed_content is mapping else {} %}
+    {% set mixed_items = mixed['items'] if mixed and ('items' in mixed) and (mixed['items'] is iterable) else [] %}
 
     {# ---------- topline cards ---------- #}
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -200,16 +223,6 @@
           <div class="text-sm text-slate-500 mb-2">Hreflang</div>
           <div class="flex flex-wrap gap-2">
             {% for row in hreflang %}{{ pill((row.hreflang or row.get('hreflang','')) ~ ' → ' ~ (row.href or row.get('href','')), 'violet') }}{% endfor %}
-          </div>
-          <div class="mt-2">
-            {{ badge(hreflang_validation.ok, hreflang_validation.ok and 'Hreflang OK' or 'Hreflang Issues') }}
-            {% if not hreflang_validation.ok %}
-              <ul class="list-disc list-inside text-sm mt-2">
-                {% for err in hreflang_validation.errors %}
-                  <li class="break-all">{{ err.type }}{% if err.code %}: {{ err.code }}{% endif %}{% if err.href %} → {{ err.href }}{% endif %}</li>
-                {% endfor %}
-              </ul>
-            {% endif %}
           </div>
         </div>
       {% endif %}
@@ -346,22 +359,32 @@
           </div>
         {% endif %}
       </div>
+      {% if result.json_ld and result.json_ld|length %}
+        <details>
+          <summary class="cursor-pointer text-sm font-medium">JSON-LD (first item)</summary>
+          <pre class="text-xs bg-slate-900 text-slate-100 rounded-md p-4 overflow-x-auto">{{ (result.json_ld[0] or {}) | tojson(indent=2) }}</pre>
+        </details>
+      {% endif %}
     {% endcall %}
 
     <!-- Indexing & Crawling -->
     {% call section('Indexing & Crawling', false) %}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="bg-white border rounded-md p-4">
-          <div class="font-semibold mb-2">Robots & Sitemaps</div>
+          <div class="font-semibold mb-2">Robots &amp; Sitemaps</div>
           <div class="space-y-1">
             {{ krow('robots.txt', result.robots_url or '—') }}
             {% if result.crawl_checks %}
+              {{ krow('Blocked by robots for this UA', result.crawl_checks.blocked_by_robots if result.crawl_checks.blocked_by_robots is not none else 'Unknown') }}
               <div class="text-sm text-slate-500 mt-3">Sitemaps discovered (from robots.txt)</div>
               <ul class="mt-1 space-y-1 list-disc list-inside">
                 {% for sm in sitemaps %}
                   <li class="break-all">{{ sm.url }} {% if sm.status %}<span class="text-slate-500">(status {{ sm.status }})</span>{% elif sm.note %}<span class="text-slate-500">({{ sm.note }})</span>{% elif sm.error %}<span class="text-red-600">({{ sm.error }})</span>{% endif %}</li>
                 {% else %}<li class="text-slate-400">None</li>{% endfor %}
               </ul>
+              {% if result.sitemap_summary %}
+                <div class="mt-3 text-sm text-slate-600">Sitemap sample URL tags: {{ result.sitemap_summary.sampled_url_count }}</div>
+              {% endif %}
             {% endif %}
           </div>
         </div>
@@ -378,24 +401,6 @@
           </div>
         </div>
       </div>
-
-      <!-- Sitemap summary -->
-      <div class="bg-white border rounded-md p-4 mt-6">
-        <div class="font-semibold mb-2">Sitemap Summary</div>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {{ krow('Sitemaps Found', sitemap_summary.sitemaps_found or 0) }}
-          {{ krow('Sampled URLs', sitemap_summary.sampled_url_count or 0) }}
-          {{ krow('Possible Orphans (sample)', (sitemap_summary.possible_orphans_sampled or [])|length) }}
-        </div>
-        {% if sitemap_summary.possible_orphans_sampled and (sitemap_summary.possible_orphans_sampled|length) %}
-          <details class="mt-2">
-            <summary class="cursor-pointer text-sm">Show possible orphans (sample)</summary>
-            <ul class="mt-2 space-y-1 list-disc list-inside">
-              {% for u in sitemap_summary.possible_orphans_sampled %}<li class="truncate"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
-            </ul>
-          </details>
-        {% endif %}
-      </div>
     {% endcall %}
 
     <!-- Performance -->
@@ -407,56 +412,38 @@
           {{ krow('Page size (bytes)', result.performance.page_size_bytes if result.performance else result.content_length) }}
           {{ krow('HTTP version', result.performance.http_version if result.performance else '—') }}
           {{ krow('Redirects', result.performance.redirects if result.performance else '—') }}
+          {% if result.pagespeed and (not result.pagespeed.enabled) and result.pagespeed.message and result.pagespeed.message.lower().startswith('skipped') %}
+            <div class="text-xs text-slate-500 mt-2">PageSpeed Insights skipped to keep this scan fast.</div>
+          {% endif %}
         </div>
         <div class="bg-white border rounded-md p-4">
-          <div class="font-semibold mb-2">PageSpeed (incl. CrUX)</div>
+          <div class="font-semibold mb-2">PageSpeed (if enabled)</div>
           {% if result.pagespeed and result.pagespeed.enabled %}
             <div class="flex flex-wrap gap-2 mb-2">
               {{ badge(result.performance.mobile_score is not none, 'Mobile: ' ~ (result.performance.mobile_score or '—')) }}
               {{ badge(result.performance.desktop_score is not none, 'Desktop: ' ~ (result.performance.desktop_score or '—')) }}
             </div>
             <details class="mb-2" open>
-              <summary class="cursor-pointer text-sm font-medium">Mobile lab metrics</summary>
+              <summary class="cursor-pointer text-sm font-medium">Mobile metrics</summary>
               <ul class="mt-2 text-sm space-y-1">
                 {% for k,v in ps_mobile_metrics.items() %}<li class="flex justify-between"><span class="text-slate-600">{{ k }}</span><span class="font-medium">{{ v }}</span></li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
               </ul>
             </details>
             <details>
-              <summary class="cursor-pointer text-sm font-medium">Desktop lab metrics</summary>
+              <summary class="cursor-pointer text-sm font-medium">Desktop metrics</summary>
               <ul class="mt-2 text-sm space-y-1">
                 {% for k,v in ps_desktop_metrics.items() %}<li class="flex justify-between"><span class="text-slate-600">{{ k }}</span><span class="font-medium">{{ v }}</span></li>{% else %}<li class="text-slate-400">None</li>{% endfor %}
               </ul>
             </details>
-            <div class="mt-3">
-              <div class="text-sm text-slate-500 mb-1">CrUX Field Data (p75)</div>
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div class="bg-slate-50 rounded-md p-3 border">
-                  <div class="font-medium mb-1">Mobile Field</div>
-                  <div class="text-sm space-y-1">
-                    {{ krow('LCP p75 (ms)', ps_mobile_field.LCP_p75_ms or '—') }}
-                    {{ krow('CLS p75', ps_mobile_field.CLS_p75 or '—') }}
-                    {{ krow('INP p75 (ms)', ps_mobile_field.INP_p75_ms or '—') }}
-                  </div>
-                </div>
-                <div class="bg-slate-50 rounded-md p-3 border">
-                  <div class="font-medium mb-1">Desktop Field</div>
-                  <div class="text-sm space-y-1">
-                    {{ krow('LCP p75 (ms)', ps_desktop_field.LCP_p75_ms or '—') }}
-                    {{ krow('CLS p75', ps_desktop_field.CLS_p75 or '—') }}
-                    {{ krow('INP p75 (ms)', ps_desktop_field.INP_p75_ms or '—') }}
-                  </div>
-                </div>
-              </div>
-            </div>
           {% else %}
             <div class="text-sm text-slate-500">
-              Pagespeed API not enabled.
+              PageSpeed API not enabled (or skipped in quick mode).
               {% if result.pagespeed and result.pagespeed.message %}
                 <div class="mt-1">{{ result.pagespeed.message }}</div>
               {% endif %}
               <ul class="list-disc list-inside mt-2 text-slate-500">
-                <li>Set a PageSpeed API key on the server (e.g., <code>PAGESPEED_API_KEY</code>).</li>
-                <li>Enable the feature in your config and re-run analysis.</li>
+                <li>Set <code>PAGESPEED_API_KEY</code> to enable PSI.</li>
+                <li>Use <em>Deep</em> mode to fetch PSI in this run.</li>
               </ul>
             </div>
           {% endif %}
@@ -464,72 +451,28 @@
         <div class="bg-white border rounded-md p-4">
           <div class="font-semibold mb-2">Security</div>
           {{ krow('HTTPS', (result.performance.https.is_https if result.performance else result.url.startswith('https')) and 'Yes' or 'No') }}
-          <div class="mt-3 text-sm">
-            <div class="font-medium mb-1">Security Headers (score {{ (security_headers.score_6 or 0) if security_headers else 0 }}/6)</div>
-            <div class="flex flex-wrap gap-2">
-  {{ badge(security_headers.hsts is not none, 'HSTS') }}
-  {{ badge(security_headers.csp is not none, 'CSP') }}
-  {{ badge(security_headers.xcto == 'nosniff' if security_headers else none, 'X-Content-Type-Options') }}
-  {{ badge(security_headers.xfo in ['DENY','SAMEORIGIN'] if security_headers else none, 'X-Frame-Options') }}
-  {{ badge(security_headers.referrer_policy is not none, 'Referrer-Policy') }}
-  {{ badge(security_headers.permissions_policy is not none, 'Permissions-Policy') }}
-</div>
-
-          </div>
+          {{ krow('SSL checked', (result.performance.https.ssl_checked if result.performance else false) and 'Yes' or 'No') }}
+          {{ krow('SSL OK', result.performance.https.ssl_ok if result.performance else '—') }}
         </div>
       </div>
     {% endcall %}
 
-    <!-- Assets & Caching -->
-    {% call section('Assets & Caching', false) %}
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {{ krow('Sampled assets', assets_audit.total_sampled or 0) }}
-        {{ krow('Compressed (%)', assets_audit.compressed_percent is not none and (assets_audit.compressed_percent ~ '%') or '—') }}
-        {{ krow('Cacheable (%)', assets_audit.cacheable_percent is not none and (assets_audit.cacheable_percent ~ '%') or '—') }}
+    <!-- Mixed Content (HTTPS) -->
+    {% call section('Mixed Content (HTTPS)', false) %}
+      <div class="text-sm text-slate-600">
+        {{ krow('Affected assets', mixed.affected if mixed and ('affected' in mixed) else 0) }}
       </div>
-      {% if assets_audit.big_assets and (assets_audit.big_assets|length) %}
-        <div class="mt-3">
-          <div class="text-sm text-slate-500 mb-1">Largest assets (bytes)</div>
-          <ul class="list-disc list-inside text-sm space-y-1">
-            {% for it in assets_audit.big_assets %}
-              <li class="break-all">{{ it.url }} — {{ it.bytes }}</li>
-            {% endfor %}
+      {% if mixed_items and (mixed_items|length) %}
+        <details class="mt-2">
+          <summary class="cursor-pointer text-sm font-medium">Show mixed-content URLs (sample)</summary>
+          <ul class="mt-2 space-y-1 list-disc list-inside">
+            {% for u in mixed_items %}<li class="break-all"><a class="text-blue-700 hover:underline" href="{{ u }}" target="_blank">{{ u }}</a></li>{% endfor %}
           </ul>
-        </div>
-      {% endif %}
-      {% if assets_audit.legacy_images and (assets_audit.legacy_images|length) %}
-        <div class="mt-3">
-          <div class="text-sm text-slate-500 mb-1">Legacy images (consider WebP/AVIF)</div>
-          <ul class="list-disc list-inside text-sm space-y-1">
-            {% for u in assets_audit.legacy_images %}
-              <li class="break-all"><a href="{{ u }}" class="text-blue-700 hover:underline" target="_blank">{{ u }}</a></li>
-            {% endfor %}
-          </ul>
-        </div>
+        </details>
+      {% else %}
+        <div class="text-sm text-slate-500 mt-2">No mixed-content issues detected on this page.</div>
       {% endif %}
     {% endcall %}
-
-   {% call section('Mixed Content (HTTPS)', false) %}
-  {% set mc_items = mixed_content['items'] if mixed_content and ('items' in mixed_content) else [] %}
-  {% set mc_affected = mixed_content['affected'] if mixed_content and ('affected' in mixed_content) else 0 %}
-
-  <div class="flex items-center gap-2">
-    {{ badge(mc_affected == 0, (mc_affected == 0) and 'No mixed content' or (mc_affected ~ ' insecure assets')) }}
-  </div>
-
-  {% if mc_items and (mc_items|length) %}
-    <details class="mt-2">
-      <summary class="cursor-pointer text-sm">Show insecure asset URLs</summary>
-      <ul class="mt-2 list-disc list-inside text-sm space-y-1">
-        {% for u in mc_items %}
-          <li class="break-all">
-            <a href="{{ u }}" class="text-blue-700 hover:underline" target="_blank">{{ u }}</a>
-          </li>
-        {% endfor %}
-      </ul>
-    </details>
-  {% endif %}
-{% endcall %}
 
     <!-- Raw Data (for debugging / export) -->
     {% call section('Raw Result (JSON)', false) %}
@@ -538,7 +481,9 @@
 
   {% else %}
     <div class="bg-white border rounded-lg p-6 text-slate-600">
-      Paste a URL above and hit Analyze to see a full SEO & performance report. The dashboard includes Page Overview, SEO Meta, Content Structure, Links, Media, Structured Data, Indexing & Crawling, **Security headers**, **Assets & Caching**, **Mixed Content**, and PageSpeed + **CrUX field data**. Use the “Download as PDF” button to save client-ready reports.
+      Paste a URL above and hit Analyze to see a full SEO &amp; performance report. Choose
+      <span class="font-medium">⚡ Quick</span> for faster scans (PSI skipped) or
+      <span class="font-medium">Deep</span> to include PageSpeed Insights.
     </div>
   {% endif %}
 </div>
