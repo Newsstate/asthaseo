@@ -6,8 +6,9 @@ import re
 import time
 import json
 import html
+import ast
 import string
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from xml.etree import ElementTree as ET
@@ -17,36 +18,43 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# ---------------- Tunables via env ----------------
+# =========================
+# Tunables via ENV
+# =========================
 FAST_MODE_DEFAULT = os.getenv("FAST_MODE_DEFAULT", "1") == "1"
 
 HTTP_TIMEOUT_MAIN = float(os.getenv("HTTP_TIMEOUT_MAIN", "10"))
 HTTP_TIMEOUT_HEAD = float(os.getenv("HTTP_TIMEOUT_HEAD", "5"))
 HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
 
-HEAD_MAX_WORKERS = int(os.getenv("HEAD_MAX_WORKERS", "12"))
-HEAD_SAMPLE_INTERNAL = int(os.getenv("HEAD_SAMPLE_INTERNAL", "6"))
-HEAD_SAMPLE_EXTERNAL = int(os.getenv("HEAD_SAMPLE_EXTERNAL", "6"))
-ASSET_SAMPLE_PER_TYPE = int(os.getenv("ASSET_SAMPLE_PER_TYPE", "8"))
+HEAD_MAX_WORKERS = int(os.getenv("HEAD_MAX_WORKERS", "16"))
+HEAD_SAMPLE_INTERNAL = int(os.getenv("HEAD_SAMPLE_INTERNAL", "4"))
+HEAD_SAMPLE_EXTERNAL = int(os.getenv("HEAD_SAMPLE_EXTERNAL", "4"))
+ASSET_SAMPLE_PER_TYPE = int(os.getenv("ASSET_SAMPLE_PER_TYPE", "10"))
 
 ENABLE_PSI = os.getenv("ENABLE_PSI", "1") == "1"
 PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
-PSI_IN_FAST = os.getenv("PSI_IN_FAST", "0") == "1"
+PSI_IN_FAST = os.getenv("PSI_IN_FAST", "1") == "1"
 PSI_STRATEGY_FAST = os.getenv("PSI_STRATEGY_FAST", "mobile")
-PSI_TIMEOUT = int(os.getenv("PSI_TIMEOUT", "15"))
+PSI_TIMEOUT = int(os.getenv("PSI_TIMEOUT", "20"))
 
 USE_LXML = os.getenv("USE_LXML", "1") == "1"
 
-# ---------------- Constants & headers ----------------
+# Use AMP page to collect JSON-LD if canonical has none
+JSONLD_FALLBACK_TO_AMP = os.getenv("JSONLD_FALLBACK_TO_AMP", "1") == "1"
+
+# =========================
+# User-Agent & Headers
+# =========================
 _CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-USER_AGENT = _CHROME_UA
+USER_AGENT = _CHROME_UA  # single source of truth
 
 _BASE_HEADERS = {
-    "User-Agent": USER_AGENT,
+    "User-Agent": _CHROME_UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
@@ -59,6 +67,32 @@ _BASE_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+_ALT_HEADERS = {
+    **_BASE_HEADERS,
+    "Accept-Encoding": "gzip, deflate",
+    "sec-ch-ua": '"Chromium";v="124", "Not:A-Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+_MOBILE_HEADERS = {
+    **_BASE_HEADERS,
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    ),
+    "sec-ch-ua-mobile": "?1",
+}
+
+_ANTIBOT_MARKERS = (
+    "cloudflare", "attention required", "just a moment", "cf-chl",
+    "incapsula", "sucuri", "access denied", "request blocked",
+    "unusual traffic", "bot detected", "verify you are human"
+)
+
+# =========================
+# Utilities & Globals
+# =========================
 STOPWORDS = set("""
 a an the and or but if then else for to of in on at by with from as this that those these is are be was were been being
 you your we our they their he she it its not no yes do does did done have has had having i me my mine ourselves himself
@@ -69,72 +103,193 @@ more most much many nor off over under up down out into than too very via per ju
 
 _LANG_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z]{4})?(-[a-zA-Z]{2}|\d{3})?$")
 
-# ---------------- Session ----------------
-_SESSION: Optional[requests.Session] = None
+_SESSION: requests.Session | None = None
+
+
 def _get_session() -> requests.Session:
     global _SESSION
     if _SESSION is None:
         s = requests.Session()
-        s.trust_env = False
         retry = Retry(
-            total=1, backoff_factor=0.1,
+            total=1,
+            backoff_factor=0.1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET"],
         )
         adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retry)
-        s.mount("http://", adapter); s.mount("https://", adapter)
-        s.headers.update(_BASE_HEADERS)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        s.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+        s.trust_env = False
         _SESSION = s
     return _SESSION
 
-# ---------------- Helpers ----------------
+
+def _looks_like_antibot(resp: requests.Response) -> bool:
+    if resp.status_code in (401, 403, 429, 503):
+        return True
+    text = (resp.text or "")[:5000].lower()
+    if any(tok in text for tok in _ANTIBOT_MARKERS):
+        return True
+    server = resp.headers.get("server", "").lower()
+    if any(v in server for v in ("cloudflare", "akamai", "sucuri")) and len(resp.text or "") < 1500:
+        return True
+    ctype = resp.headers.get("content-type", "")
+    if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
+        return True
+    return False
+
+
+def fetch_html_hardened(url: str, referer: str | None = None, timeout_s: int = 25):
+    """(response, html, meta) – try 3 different header profiles."""
+    sess = requests.Session()
+    sess.trust_env = False
+    tries = []
+    for hdr in (_BASE_HEADERS, _ALT_HEADERS, _MOBILE_HEADERS):
+        h = dict(hdr)
+        if referer:
+            h["Referer"] = referer
+        tries.append(h)
+
+    last_exc = None
+    last_resp = None
+    for i, hdrs in enumerate(tries, 1):
+        try:
+            r = sess.get(url, headers=hdrs, allow_redirects=True, timeout=(10, timeout_s))
+            last_resp = r
+            if not _looks_like_antibot(r):
+                return r, (r.text or ""), {"ua": hdrs["User-Agent"], "attempt": i, "final_url": str(r.url)}
+        except Exception as e:
+            last_exc = e
+
+    if last_resp is not None:
+        meta = {
+            "ua": last_resp.request.headers.get("User-Agent"),
+            "attempt": len(tries),
+            "final_url": str(last_resp.url),
+            "warning": f"Likely blocked/challenged by WAF (HTTP {last_resp.status_code}).",
+        }
+        return last_resp, (last_resp.text or ""), meta
+
+    raise last_exc or RuntimeError("Failed to fetch URL")
+
+
 def _normalize_url(u: str) -> str:
     u = (u or "").strip()
-    if not u: return u
+    if not u:
+        return u
     p = urlparse(u)
-    if not p.scheme: u = "https://" + u
+    if not p.scheme:
+        u = "https://" + u
     return u
 
-def _soup_parse(body: bytes) -> BeautifulSoup:
+
+def _soup_parse(body: bytes, _base_url: str) -> BeautifulSoup:
     if USE_LXML:
-        try: return BeautifulSoup(body, "lxml")
-        except Exception: pass
+        try:
+            return BeautifulSoup(body, "lxml")
+        except Exception:
+            pass
     return BeautifulSoup(body, "html.parser")
 
-def _fetch(url: str) -> Tuple[requests.Response, float]:
-    s = _get_session()
-    start = time.perf_counter()
-    r = s.get(url, allow_redirects=True, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_MAIN))
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-    return r, elapsed_ms
+
+def _get_text_density(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    for tag in soup(["script", "style", "noscript", "template"]):
+        tag.extract()
+    text = soup.get_text(separator=" ")
+    text = html.unescape(text).lower()
+    text = text.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+    words = [w for w in text.split() if w and w not in STOPWORDS and len(w) > 2]
+    if not words:
+        return []
+    total = len(words)
+    freq: Dict[str, int] = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+    top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    return [{"word": w, "count": c, "percent": round(c * 100.0 / total, 2)} for w, c in top]
+
 
 def _collect_metas(soup: BeautifulSoup) -> Tuple[Dict[str, str], Dict[str, str]]:
-    og: Dict[str, str] = {}; tw: Dict[str, str] = {}
+    og: Dict[str, str] = {}
+    tw: Dict[str, str] = {}
     for m in soup.find_all("meta"):
         name = (m.get("name") or m.get("property") or "").strip().lower()
         content = (m.get("content") or "").strip()
-        if not name or not content: continue
-        if name.startswith("og:"): og[name] = content
-        if name.startswith("twitter:"): tw[name] = content
+        if not name or not content:
+            continue
+        if name.startswith("og:"):
+            og[name] = content
+        if name.startswith("twitter:"):
+            tw[name] = content
     return og, tw
 
-def _detect_amp(soup: BeautifulSoup, base_url: str) -> Tuple[bool, Optional[str]]:
+
+def _bool_badge(ok: bool | None) -> bool | None:
+    return True if ok is True else (None if ok is None else False)
+
+
+def _safe_len(s: str | None) -> int:
+    return len(s or "")
+
+
+def _check_indexability(robots_meta: str | None, x_robots: str | None) -> Tuple[bool | None, str]:
+    meta = (robots_meta or "").lower()
+    x = (x_robots or "").lower()
+    tokens = set(re.split(r"[,\s]+", (meta + " " + x).strip()))
+    if not tokens or tokens == {""}:
+        return (None, "unknown")
+    if "noindex" in tokens or "none" in tokens:
+        return (False, "noindex")
+    return (True, "index")
+
+
+def _detect_amp(soup: BeautifulSoup, base_url: str) -> Tuple[bool, str | None]:
     html_tag = soup.find("html")
     is_amp = bool(html_tag and (html_tag.has_attr("amp") or html_tag.has_attr("⚡")))
     amp_link = soup.find("link", rel=lambda v: v and "amphtml" in v.lower())
     amp_url = urljoin(base_url, amp_link["href"]) if amp_link and amp_link.get("href") else None
     return is_amp, amp_url
 
-def _get_text_density(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    for tag in soup(["script", "style", "noscript", "template"]): tag.extract()
-    text = html.unescape(soup.get_text(separator=" ")).lower()
-    text = text.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
-    words = [w for w in text.split() if w and w not in STOPWORDS and len(w) > 2]
-    if not words: return []
-    total = len(words); freq: Dict[str, int] = {}
-    for w in words: freq[w] = freq.get(w, 0) + 1
-    top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    return [{"word": w, "count": c, "percent": round(c * 100.0 / total, 2)} for w, c in top]
+
+def _hreflang_links(soup: BeautifulSoup, base: str) -> List[Dict[str, str]]:
+    out = []
+    for ln in soup.find_all("link", rel=lambda v: v and "alternate" in v.lower()):
+        if (ln.get("hreflang") or ln.get("href")):
+            out.append({
+                "hreflang": (ln.get("hreflang") or "").strip(),
+                "href": urljoin(base, (ln.get("href") or "").strip())
+            })
+    return out
+
+
+def _validate_hreflang(hreflang: List[Dict[str, str]], base_host: str) -> Dict[str, Any]:
+    errors = []
+    seen = {}
+    x_default_count = 0
+    for row in hreflang:
+        hl = (row.get("hreflang") or "").strip()
+        href = (row.get("href") or "").strip()
+        if not hl or not href:
+            errors.append({"type": "missing_values", "item": row}); continue
+        if hl.lower() == "x-default":
+            x_default_count += 1
+        elif not _LANG_RE.match(hl):
+            errors.append({"type": "invalid_code", "code": hl, "href": href})
+        host = urlparse(href).netloc.lower()
+        if host and base_host and host != base_host:
+            errors.append({"type": "cross_host", "code": hl, "href": href, "host": host})
+        key = (hl.lower(), href)
+        if key in seen:
+            errors.append({"type": "duplicate", "code": hl, "href": href})
+        seen[key] = True
+    if x_default_count > 1:
+        errors.append({"type": "multiple_x_default", "count": x_default_count})
+    return {"errors": errors, "ok": len(errors) == 0}
+
 
 def _extract_links(soup: BeautifulSoup, base: str) -> Tuple[List[str], List[str], List[str]]:
     host = urlparse(base).netloc.lower()
@@ -145,77 +300,193 @@ def _extract_links(soup: BeautifulSoup, base: str) -> Tuple[List[str], List[str]
         rel = (a.get("rel") or [])
         reltxt = " ".join(rel).lower() if isinstance(rel, list) else str(rel).lower()
         (internal if (host and netloc == host) else external).append(href)
-        if "nofollow" in reltxt: nofollow.append(href)
+        if "nofollow" in reltxt:
+            nofollow.append(href)
+
     def _dedup(lst: List[str]) -> List[str]:
         seen = set(); out = []
         for u in lst:
-            if u not in seen: out.append(u); seen.add(u)
+            if u not in seen:
+                out.append(u); seen.add(u)
         return out
+
     return _dedup(internal), _dedup(external), _dedup(nofollow)
+
 
 def _head_one(url: str) -> Dict[str, Any]:
     s = _get_session()
     try:
         r = s.head(url, allow_redirects=True, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
-        return {"url": url, "final_url": r.url, "status": r.status_code,
-                "redirects": len(r.history), "headers": dict(r.headers)}
+        return {
+            "url": url,
+            "final_url": r.url,
+            "status": r.status_code,
+            "redirects": len(r.history),
+            "headers": dict(r.headers),
+        }
     except Exception as e:
         return {"url": url, "status": None, "redirects": 0, "error": str(e)}
 
+
 def _sample_status(internal: List[str], external: List[str], fast: bool) -> Dict[str, List[Dict[str, Any]]]:
-    n_int = HEAD_SAMPLE_INTERNAL if not fast else max(1, HEAD_SAMPLE_INTERNAL // 2)
-    n_ext = HEAD_SAMPLE_EXTERNAL if not fast else max(1, HEAD_SAMPLE_EXTERNAL // 2)
-    ints = internal[:n_int]; exts = external[:n_ext]
-    rows_int: List[Dict[str, Any]] = []; rows_ext: List[Dict[str, Any]] = []
+    n_int = max(0, HEAD_SAMPLE_INTERNAL // (2 if fast else 1))
+    n_ext = max(0, HEAD_SAMPLE_EXTERNAL // (2 if fast else 1))
+    ints = internal[:n_int or HEAD_SAMPLE_INTERNAL]
+    exts = external[:n_ext or HEAD_SAMPLE_EXTERNAL]
+
+    rows_int: List[Dict[str, Any]] = []
+    rows_ext: List[Dict[str, Any]] = []
     tasks = {u: ("int", u) for u in ints} | {u: ("ext", u) for u in exts}
-    if not tasks: return {"internal": [], "external": []}
+
+    if not tasks:
+        return {"internal": [], "external": []}
+
     with ThreadPoolExecutor(max_workers=min(HEAD_MAX_WORKERS, len(tasks))) as tp:
-        futs = {tp.submit(_head_one, u): kind for u, (kind, _) in tasks.items()}
+        futs = {tp.submit(_head_one, u): (kind, u) for u, (kind, _) in tasks.items()}
         for f in as_completed(futs):
-            kind = futs[f]; row = f.result()
+            kind, _u = futs[f]
+            row = f.result()
             (rows_int if kind == "int" else rows_ext).append(row)
+
     return {"internal": rows_int, "external": rows_ext}
 
+
 def _robots_and_sitemaps(base: str) -> Dict[str, Any]:
-    try:
-        parts = urlparse(base); robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
-    except Exception:
-        robots_url = None
+    robots_url = f"{urlparse(base).scheme}://{urlparse(base).netloc}/robots.txt"
+    s = _get_session()
     sitemaps: List[Dict[str, Any]] = []
-    if robots_url:
-        try:
-            r = _get_session().get(robots_url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
-            if r.status_code == 200 and r.text:
-                for line in r.text.splitlines():
-                    if line.lower().startswith("sitemap:"):
-                        sitemaps.append({"url": line.split(":", 1)[1].strip(), "status": None})
-        except Exception as e:
-            sitemaps = [{"url": None, "error": f"robots fetch failed: {e}"}]
+    try:
+        r = s.get(robots_url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
+        if r.status_code == 200 and r.text:
+            for line in r.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sm_url = line.split(":", 1)[1].strip()
+                    try:
+                        h = s.head(sm_url, allow_redirects=True, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
+                        sitemaps.append({"url": sm_url, "status": h.status_code})
+                    except Exception as e:
+                        sitemaps.append({"url": sm_url, "error": str(e)})
+    except Exception as e:
+        sitemaps = [{"url": None, "error": f"robots fetch failed: {e}"}]
     return {"robots_url": robots_url, "sitemaps": sitemaps, "blocked_by_robots": None}
 
-def _extract_assets(soup: BeautifulSoup, base: str, max_per_type: int = 8) -> Dict[str, List[str]]:
+
+def _fetch_xml(url: str) -> str | None:
+    try:
+        r = _get_session().get(url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT_HEAD))
+        if r.status_code == 200 and "xml" in (r.headers.get("Content-Type", "").lower()):
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def _parse_sitemap_urls(xml_text: str) -> List[str]:
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        for u in root.findall(".//sm:url/sm:loc", ns):
+            if u.text:
+                out.append(u.text.strip())
+    except Exception:
+        pass
+    return out
+
+
+def _parse_sitemap_index(xml_text: str) -> List[str]:
+    idx = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        for u in root.findall(".//sm:sitemap/sm:loc", ns):
+            if u.text:
+                idx.append(u.text.strip())
+    except Exception:
+        pass
+    return idx
+
+
+def _collect_sitemap_sample(sitemap_urls: List[str], cap: int = 500) -> List[str]:
+    collected: List[str] = []
+    for sm in sitemap_urls:
+        xml = _fetch_xml(sm)
+        if not xml:
+            continue
+        urls = _parse_sitemap_urls(xml)
+        if urls:
+            for u in urls:
+                collected.append(u)
+                if len(collected) >= cap:
+                    return collected
+        else:
+            idx = _parse_sitemap_index(xml)
+            for child in idx:
+                x = _fetch_xml(child)
+                if not x:
+                    continue
+                for u in _parse_sitemap_urls(x):
+                    collected.append(u)
+                    if len(collected) >= cap:
+                        return collected
+    return collected
+
+
+def _extract_assets(soup: BeautifulSoup, base: str, max_per_type: int = 10) -> Dict[str, List[str]]:
     css = [urljoin(base, l["href"].strip())
            for l in soup.find_all("link", rel=lambda v: v and "stylesheet" in v.lower(), href=True)]
-    js = [urljoin(base, s["src"].strip()) for s in soup.find_all("script", src=True)]
-    imgs = [urljoin(base, im["src"].strip()) for im in soup.find_all("img", src=True)]
-    return {"css": css[:max_per_type], "js": js[:max_per_type], "img": imgs[:max_per_type]}
+    js = [urljoin(base, s["src"].strip())
+          for s in soup.find_all("script", src=True)]
+    imgs = [urljoin(base, im["src"].strip())
+            for im in soup.find_all("img", src=True)]
+    return {
+        "css": css[:max_per_type],
+        "js": js[:max_per_type],
+        "img": imgs[:max_per_type],
+    }
+
+
+def _head_many(urls: List[str]) -> List[Dict[str, Any]]:
+    if not urls:
+        return []
+    rows: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(HEAD_MAX_WORKERS, len(urls))) as tp:
+        futs = [tp.submit(_head_one, u) for u in urls]
+        for f in as_completed(futs):
+            rows.append(f.result())
+    return rows
+
 
 def _audit_assets(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    total = len(rows); compressed = 0; cacheable = 0
-    big_assets: List[Dict[str, Any]] = []; legacy_imgs: List[str] = []
+    total = len(rows)
+    compressed = 0
+    cacheable = 0
+    big_assets: List[Dict[str, Any]] = []
+    legacy_imgs: List[str] = []
     for r in rows:
-        if r.get("status") is None: continue
+        if r.get("status") is None:
+            continue
         h = {k.lower(): v for k, v in (r.get("headers") or {}).items()}
         cenc = (h.get("content-encoding") or "").lower()
         cctl = (h.get("cache-control") or "").lower()
-        clen = h.get("content-length"); ctype = (h.get("content-type") or "").lower()
-        if cenc in ("gzip", "br", "deflate"): compressed += 1
-        if any(tok in cctl for tok in ("max-age", "s-maxage")) and "no-store" not in cctl: cacheable += 1
-        try: size = int(clen) if clen is not None else None
-        except Exception: size = None
-        if size and size >= 300_000: big_assets.append({"url": r.get("final_url") or r.get("url"), "bytes": size})
+        clen = h.get("content-length")
+        ctype = (h.get("content-type") or "").lower()
+
+        if cenc in ("gzip", "br", "deflate"):
+            compressed += 1
+        if any(tok in cctl for tok in ("max-age", "s-maxage")) and "no-store" not in cctl:
+            cacheable += 1
+
+        try:
+            size = int(clen) if clen is not None else None
+        except Exception:
+            size = None
+        if size and size >= 300_000:
+            big_assets.append({"url": r.get("final_url") or r.get("url"), "bytes": size})
+
         if ctype.startswith("image/") and not any(fmt in ctype for fmt in ("webp", "avif")):
             legacy_imgs.append(r.get("final_url") or r.get("url"))
+
     return {
         "total_sampled": total,
         "compressed_percent": round(100.0 * compressed / total, 1) if total else 0.0,
@@ -224,122 +495,147 @@ def _audit_assets(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "legacy_images": legacy_imgs[:10],
     }
 
+
 def _mixed_content(assets: Dict[str, List[str]], page_url: str) -> Dict[str, Any]:
-    if not page_url.startswith("https://"): return {"affected": 0, "items": []}
+    if not page_url.startswith("https://"):
+        return {"affected": 0, "items": []}
     flat = assets.get("css", []) + assets.get("js", []) + assets.get("img", [])
     bad = [u for u in flat if u.startswith("http://")]
     return {"affected": len(bad), "items": bad[:20]}
 
-def _check_indexability(robots_meta: Optional[str], x_robots: Optional[str]) -> Tuple[Optional[bool], str]:
-    meta = (robots_meta or "").lower(); x = (x_robots or "").lower()
-    tokens = set(re.split(r"[,\s]+", (meta + " " + x).strip()))
-    if not tokens or tokens == {""}: return (None, "unknown")
-    if "noindex" in tokens or "none" in tokens: return (False, "noindex")
-    return (True, "index")
 
-# ---------------- Structured Data helpers ----------------
-_CLEAN_TAILING_COMMAS = re.compile(r",\s*([}\]])")
-_FIRST_JSON = re.compile(r"[\[\{].*[\]\}]", re.S)
+def _audit_security_headers(headers: dict) -> Dict[str, Any]:
+    hv = {k.lower(): v for k, v in (headers or {}).items()}
+    report = {
+        "hsts": hv.get("strict-transport-security"),
+        "csp": hv.get("content-security-policy"),
+        "xcto": hv.get("x-content-type-options"),
+        "xfo": hv.get("x-frame-options"),
+        "referrer_policy": hv.get("referrer-policy"),
+        "permissions_policy": hv.get("permissions-policy") or hv.get("feature-policy"),
+    }
+    score = 0
+    score += 1 if report["hsts"] and "max-age" in (report["hsts"] or "") else 0
+    score += 1 if report["csp"] else 0
+    score += 1 if (report["xcto"] or "").lower() == "nosniff" else 0
+    score += 1 if (report["xfo"] or "").upper() in ("DENY", "SAMEORIGIN") else 0
+    score += 1 if report["referrer_policy"] else 0
+    score += 1 if report["permissions_policy"] else 0
+    report["score_6"] = score
+    return report
 
-def _jsonld_sanitize(raw: str) -> str:
-    """Make common publisher JSON-LD mistakes parseable."""
+# =========================
+# Structured Data helpers
+# =========================
+def _relaxed_json_loads(raw: str):
+    if not raw:
+        return None
     s = raw.strip()
-    # strip HTML comments / CDATA
+    # strip comments
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
     s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
-    s = re.sub(r"<!\[CDATA\[|\]\]>", "", s)
-    # keep from first { or [ to last } or ]
-    m = _FIRST_JSON.search(s)
+    s = re.sub(r"(?m)^\s*//.*?$", "", s)
+    # start at first JSON bracket
+    m = re.search(r"[\{\[]", s)
     if m:
-        s = m.group(0)
-    # remove trailing commas before } or ]
-    s = _CLEAN_TAILING_COMMAS.sub(r"\1", s)
-    return s
+        s = s[m.start():]
+    # remove trailing commas
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        try:
+            s2 = s.replace("true", "True").replace("false", "False").replace("null", "None")
+            return ast.literal_eval(s2)
+        except Exception:
+            return None
 
-def _flatten_jsonld(obj: Any) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+
+def _flatten_jsonld(obj) -> List[dict]:
+    out = []
+    if obj is None:
+        return out
     if isinstance(obj, list):
-        for it in obj: out.extend(_flatten_jsonld(it))
+        for it in obj:
+            out.extend(_flatten_jsonld(it))
     elif isinstance(obj, dict):
         if "@graph" in obj and isinstance(obj["@graph"], list):
-            out.extend(_flatten_jsonld(obj["@graph"]))
+            for it in obj["@graph"]:
+                out.extend(_flatten_jsonld(it))
         else:
             out.append(obj)
     return out
 
-# minimal required fields by type (best-effort)
-_REQUIRED_BY_TYPE = {
-    "Article": ["headline", "datePublished"],
-    "NewsArticle": ["headline", "datePublished"],
-    "BlogPosting": ["headline", "datePublished"],
-    "WebPage": ["name"],
-    "Organization": ["name"],
-    "Product": ["name"],
-    "BreadcrumbList": ["itemListElement"],
-    "FAQPage": ["mainEntity"],
-    "HowTo": ["name", "step"],
-    "Event": ["name", "startDate"],
-    "LocalBusiness": ["name", "address"],
-    "Recipe": ["name", "recipeIngredient"],
-    "VideoObject": ["name", "uploadDate"],
-}
 
-def _validate_jsonld_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    rows = []
-    ok_count = 0
-    for it in items:
-        types = it.get("@type")
-        # normalize @type => one or many
-        if isinstance(types, list) and types:
-            type_name = str(types[0])
-        elif isinstance(types, str):
-            type_name = types
-        else:
-            type_name = "Unknown"
+def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[dict], List[str]]:
+    items, errs = [], []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = tag.get_text() or ""
+        data = _relaxed_json_loads(raw)
+        if data is None:
+            errs.append("JSON-LD parse failed (non-strict JSON)")
+            continue
+        items.extend(_flatten_jsonld(data))
+    return items, errs
 
-        req = _REQUIRED_BY_TYPE.get(type_name, [])
-        missing = [k for k in req if it.get(k) in (None, "", [], {})]
-        ok = len(missing) == 0
-        if ok: ok_count += 1
-        rows.append({"type": type_name, "ok": ok, "missing": missing})
-    return {
-        "summary": {
-            "total_items": len(items),
-            "ok_count": ok_count,
-            "has_errors": ok_count < len(items),
-        },
-        "items": rows,
-    }
 
-def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[Dict[str, Any]], List[str]]:
-    found: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    for tag in soup.find_all("script", type=lambda v: v and "ld+json" in v.lower()):
-        raw = tag.string if tag.string is not None else tag.get_text()
-        if not raw: continue
-        txt = _jsonld_sanitize(raw)
-        try:
-            data = json.loads(txt)
-            found.extend(_flatten_jsonld(data))
-        except Exception as e:
-            # capture a short snippet for debugging
-            snippet = (txt[:140] + "…") if len(txt) > 140 else txt
-            errors.append(f"JSON-LD parse error: {e}; snippet={snippet}")
-    return found, errors
+def _extract_microdata(soup: BeautifulSoup, base_url: str) -> List[dict]:
+    out = []
+    for scope in soup.find_all(attrs={"itemscope": True}):
+        item: dict = {}
+        t = scope.get("itemtype")
+        if t:
+            item["@type"] = t
+        iid = scope.get("itemid")
+        if iid:
+            item["@id"] = urljoin(base_url, iid)
+        for el in scope.find_all(attrs={"itemprop": True}):
+            name = el.get("itemprop")
+            val = el.get("content") or el.get("href") or el.get("src") or el.get_text(strip=True)
+            if not name:
+                continue
+            item.setdefault(name, []).append(val)
+        out.append(item)
+    return out
 
-# ---------------- PageSpeed (optional) ----------------
+
+def _extract_rdfa(soup: BeautifulSoup, base_url: str) -> List[dict]:
+    out = []
+    for el in soup.find_all(attrs={"typeof": True}):
+        item: dict = {"@type": el.get("typeof")}
+        rid = el.get("about") or el.get("resource")
+        if rid:
+            item["@id"] = urljoin(base_url, rid)
+        for p in el.find_all(attrs={"property": True}):
+            name = p.get("property")
+            val = p.get("content") or p.get("href") or p.get("src") or p.get_text(strip=True)
+            if not name:
+                continue
+            item.setdefault(name, []).append(val)
+        out.append(item)
+    return out
+
+# =========================
+# PageSpeed (Lighthouse / CrUX)
+# =========================
 def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-    r = _get_session().get(base, params={"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY},
-                           timeout=(HTTP_CONNECT_TIMEOUT, timeout_sec))
+    s = _get_session()
+    params = {"url": url, "strategy": strategy}
+    if PAGESPEED_API_KEY:
+        params["key"] = PAGESPEED_API_KEY
+    r = s.get(base, params=params, timeout=(HTTP_CONNECT_TIMEOUT, timeout_sec))
     r.raise_for_status()
     data = r.json()
     lr = data.get("lighthouseResult", {})
     audits = lr.get("audits", {})
-    score = lr.get("categories", {}).get("performance", {}).get("score")
-    def metr(k):
-        v = audits.get(k, {}).get("numericValue")
-        return v if isinstance(v, (int, float)) else None
+    cat = lr.get("categories", {}).get("performance", {})
+    score = cat.get("score")
+
+    def metr(audit_key: str):
+        v = audits.get(audit_key, {}).get("numericValue")
+        return v if v is not None else None
+
     metrics = {
         "First Contentful Paint (ms)": metr("first-contentful-paint"),
         "Largest Contentful Paint (ms)": metr("largest-contentful-paint"),
@@ -348,26 +644,73 @@ def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
         "Speed Index (ms)": metr("speed-index"),
         "Time To Interactive (ms)": metr("interactive"),
     }
-    return {"score": score and round(score * 100), "metrics": metrics}
 
-def _pagespeed(url: str, fast: bool) -> Dict[str, Any]:
-    if not (ENABLE_PSI and PAGESPEED_API_KEY):
-        return {"enabled": False, "message": "PageSpeed disabled or missing API key"}
-    if fast and not PSI_IN_FAST:
-        return {"enabled": False, "message": "Skipped in fast mode"}
+    # minimal field data (if present)
+    def _crux(src: dict | None) -> dict:
+        if not isinstance(src, dict):
+            return {}
+        def p75(key: str):
+            try:
+                return round(src.get("metrics", {}).get(key, {}).get("percentiles", {}).get("p75"), 2)
+            except Exception:
+                return None
+        return {
+            "LCP_p75_ms": p75("LARGEST_CONTENTFUL_PAINT_MS"),
+            "CLS_p75": p75("CUMULATIVE_LAYOUT_SHIFT"),
+            "INP_p75_ms": p75("INTERACTION_TO_NEXT_PAINT"),
+            "source": src.get("overall_category")
+        }
+
+    return {
+        "score": score and round(score * 100),
+        "metrics": {k: (round(v, 0) if isinstance(v, (int, float)) else v) for k, v in metrics.items()},
+        "field_data": _crux(data.get("loadingExperience")),
+        "origin_field_data": _crux(data.get("originLoadingExperience")),
+    }
+
+
+def _pagespeed_full(url: str) -> Dict[str, Any]:
+    if not ENABLE_PSI:
+        return {"enabled": False, "message": "PageSpeed disabled"}
     out = {"enabled": True, "mobile": {"metrics": {}}, "desktop": {"metrics": {}}}
     try:
-        if fast and PSI_STRATEGY_FAST in ("mobile", "desktop"):
-            out[PSI_STRATEGY_FAST].update(_psi_call(url, PSI_STRATEGY_FAST, PSI_TIMEOUT))
-        else:
-            out["mobile"].update(_psi_call(url, "mobile", PSI_TIMEOUT))
-            out["desktop"].update(_psi_call(url, "desktop", PSI_TIMEOUT))
+        out["mobile"].update(_psi_call(url, "mobile", timeout_sec=30))
     except Exception as e:
-        out["error"] = str(e)
+        out["mobile"]["error"] = str(e)
+    try:
+        out["desktop"].update(_psi_call(url, "desktop", timeout_sec=30))
+    except Exception as e:
+        out["desktop"]["error"] = str(e)
     return out
 
-# ---------------- Public entry ----------------
-def get_pagespeed_data(target_url: str, fast: Optional[bool] = None) -> Dict[str, Any]:
+
+def _pagespeed_fast(url: str) -> Dict[str, Any]:
+    if not ENABLE_PSI:
+        return {"enabled": False, "message": "PageSpeed disabled"}
+    strat = PSI_STRATEGY_FAST.lower()
+    out = {"enabled": True, "mobile": {"metrics": {}}, "desktop": {"metrics": {}}}
+    if strat in ("mobile", "desktop"):
+        try:
+            data = _psi_call(url, strat, timeout_sec=PSI_TIMEOUT)
+            out[strat].update(data)
+        except Exception as e:
+            out[strat]["error"] = str(e)
+        return out
+    # both
+    try:
+        out["mobile"].update(_psi_call(url, "mobile", timeout_sec=PSI_TIMEOUT))
+    except Exception as e:
+        out["mobile"]["error"] = str(e)
+    try:
+        out["desktop"].update(_psi_call(url, "desktop", timeout_sec=PSI_TIMEOUT))
+    except Exception as e:
+        out["desktop"]["error"] = str(e)
+    return out
+
+# =========================
+# Public entry
+# =========================
+def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, Any]:
     fast = FAST_MODE_DEFAULT if fast is None else fast
     url = _normalize_url(target_url)
 
@@ -403,11 +746,11 @@ def get_pagespeed_data(target_url: str, fast: Optional[bool] = None) -> Dict[str
         "sitemap_summary": {},
         "assets": {"css": [], "js": [], "img": []},
         "assets_audit": {},
-        "mixed_content": {"affected": 0, "items": []},
+        "mixed_content": {},
         "security_headers": {},
         "json_ld": [],
-        "json_ld_validation": None,   # (1) NEW: fill later
-        "json_ld_errors": [],         # optional diagnostics
+        "json_ld_validation": {"summary": {"total_items": 0, "ok_count": 0, "has_errors": False}, "items": []},
+        "json_ld_errors": [],
         "microdata": [],
         "rdfa": [],
         "sd_types": {"types": []},
@@ -416,43 +759,38 @@ def get_pagespeed_data(target_url: str, fast: Optional[bool] = None) -> Dict[str
         "notes": {},
     }
 
+    # ---- Fetch (hardened)
     try:
-        resp, elapsed_ms = _fetch(url)
+        t0 = time.perf_counter()
+        resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/")
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        final_url = str(resp.url)
+        body_bytes = html_text.encode(resp.encoding or "utf-8", errors="ignore")
+        content_len = len(body_bytes)
+        soup = _soup_parse(body_bytes, final_url)
+
+        result["notes"] = {"fetch": fetch_meta}
+        if "warning" in fetch_meta:
+            result.setdefault("errors", []).append(fetch_meta["warning"])
     except Exception as e:
-        result["errors"].append(f"Fetch failed: {e}")
         result["performance"] = {
-            "final_url": url, "http_version": "HTTP/1.1", "redirects": 0,
-            "page_size_bytes": 0, "load_time_ms": None,
+            "final_url": url,
+            "http_version": "HTTP/1.1",
+            "redirects": 0,
+            "page_size_bytes": 0,
+            "load_time_ms": None,
             "https": {"is_https": url.startswith("https"), "ssl_checked": False, "ssl_ok": None},
-            "mobile_score": None, "desktop_score": None,
+            "mobile_score": None,
+            "desktop_score": None,
         }
+        result["pagespeed"] = {"enabled": False, "message": f"Fetch failed: {e}"}
+        result.setdefault("errors", []).append(f"Fetch failed: {e}")
         return result
 
-    final_url = str(resp.url)
+    # ---- Basics
     status = resp.status_code
-    body_bytes = (resp.text or "").encode(resp.encoding or "utf-8", errors="ignore")
-    content_len = len(body_bytes)
-    soup = _soup_parse(body_bytes)
+    security = _audit_security_headers(resp.headers)
 
-    # Security headers
-    hv = {k.lower(): v for k, v in resp.headers.items()}
-    security = {
-        "hsts": hv.get("strict-transport-security"),
-        "csp": hv.get("content-security-policy"),
-        "xcto": hv.get("x-content-type-options"),
-        "xfo": hv.get("x-frame-options"),
-        "referrer_policy": hv.get("referrer-policy"),
-        "permissions_policy": hv.get("permissions-policy") or hv.get("feature-policy"),
-        "score_6": 0
-    }
-    if security["hsts"] and "max-age" in security["hsts"]: security["score_6"] += 1
-    if security["csp"]: security["score_6"] += 1
-    if (hv.get("x-content-type-options") or "").lower() == "nosniff": security["score_6"] += 1
-    if (hv.get("x-frame-options") or "") in ("DENY", "SAMEORIGIN"): security["score_6"] += 1
-    if security["referrer_policy"]: security["score_6"] += 1
-    if security["permissions_policy"]: security["score_6"] += 1
-
-    # Meta basics
     title = (soup.title.string.strip() if (soup.title and soup.title.string) else None)
     m_desc = soup.find("meta", attrs={"name": "description"})
     meta_desc = m_desc.get("content").strip() if m_desc and m_desc.get("content") else None
@@ -462,106 +800,128 @@ def get_pagespeed_data(target_url: str, fast: Optional[bool] = None) -> Dict[str
     viewport_val = (viewport.get("content") or "").strip() if viewport else None
     canonical_tag = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
     canonical = urljoin(final_url, canonical_tag["href"]) if canonical_tag and canonical_tag.get("href") else None
+
     x_robots = resp.headers.get("X-Robots-Tag")
     enc = (resp.headers.get("Content-Encoding") or "").lower() or "none"
+    charset = None
+    ctype = resp.headers.get("Content-Type") or ""
+    m = re.search(r"charset=([\w\-]+)", ctype, flags=re.I)
+    if m:
+        charset = m.group(1)
+
     redirects = len(resp.history)
     http_version = "HTTP/1.1"
     is_https = final_url.startswith("https")
 
-    # OG / Twitter
     og, tw = _collect_metas(soup)
-    has_og = bool(og); has_twitter = bool(tw)
+    has_og = bool(og)
+    has_twitter = bool(tw)
 
-    # AMP
     is_amp, amp_url = _detect_amp(soup, final_url)
 
-    # Headings
     heads = {lvl: [h.get_text(strip=True) for h in soup.find_all(lvl)] for lvl in ["h1","h2","h3","h4","h5","h6"]}
 
-    # Links & images
     internal, external, nofollow = _extract_links(soup, final_url)
     images = soup.find_all("img")
     imgs_missing = [{"src": urljoin(final_url, (im.get("src") or ""))} for im in images if not (im.get("alt") or "").strip()]
-    total_imgs = len(images); miss_count = len(imgs_missing)
+    total_imgs = len(images)
+    miss_count = len(imgs_missing)
     alt_percent = round(100.0 * (total_imgs - miss_count) / total_imgs, 2) if total_imgs else 100.0
 
-    # Keyword density
     kd = _get_text_density(soup)
 
-    # robots & sitemaps (lightweight)
     crawl = _robots_and_sitemaps(final_url)
     sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
+    sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
+    orphans = [u for u in sitemap_sample if u not in set(internal)]
 
-    # Link status (sampled)
     link_checks = _sample_status(internal, external, fast=fast)
 
-    # Assets & audits
-    assets = _extract_assets(soup, final_url, max_per_type=ASSET_SAMPLE_PER_TYPE if not fast else max(1, ASSET_SAMPLE_PER_TYPE // 2))
-    flat_assets = assets["css"] + assets["js"] + assets["img"]
-    asset_rows: List[Dict[str, Any]] = []
-    if flat_assets:
-        with ThreadPoolExecutor(max_workers=min(HEAD_MAX_WORKERS, len(flat_assets))) as tp:
-            futs = [tp.submit(_head_one, u) for u in flat_assets]
-            for f in as_completed(futs):
-                asset_rows.append(f.result())
+    assets = _extract_assets(soup, final_url, max_per_type=ASSET_SAMPLE_PER_TYPE)
+    asset_rows = _head_many(assets["css"] + assets["js"] + assets["img"])
     assets_audit = _audit_assets(asset_rows)
     mixed = _mixed_content(assets, final_url)
 
-    # ---------------- (2) Extract + validate Structured Data ----------------
-    json_ld_items, json_ld_errors = _extract_jsonld(soup)
-    json_ld_validation = _validate_jsonld_items(json_ld_items)
-    # sd_types from @type (support lists)
-    types_set = set()
-    for it in json_ld_items:
-        t = it.get("@type")
-        if isinstance(t, list): types_set.update([str(x) for x in t])
-        elif isinstance(t, str): types_set.add(t)
+    base_host = urlparse(final_url).netloc.lower()
+    hreflang_list = _hreflang_links(soup, final_url)
+    hreflang_check = _validate_hreflang(hreflang_list, base_host)
 
-    # Hreflang (simple) + minimal validation
-    hreflang_list = []
-    for ln in soup.find_all("link", rel=lambda v: v and "alternate" in v.lower()):
-        if (ln.get("hreflang") or ln.get("href")):
-            hreflang_list.append({"hreflang": (ln.get("hreflang") or "").strip(),
-                                   "href": urljoin(final_url, (ln.get("href") or "").strip())})
-    errors_hl = []
-    x_default_count = sum(1 for r in hreflang_list if (r.get("hreflang") or "").lower() == "x-default")
-    if x_default_count > 1: errors_hl.append({"type": "multiple_x_default", "count": x_default_count})
-    hreflang_check = {"ok": len(errors_hl) == 0, "errors": errors_hl}
-
-    # Indexability / checks
     indexable_ok, indexable_val = _check_indexability(robots_meta, x_robots)
     checks = {
         "canonical": {"ok": bool(canonical), "value": canonical},
-        "viewport_meta": {"ok": bool(viewport_val and "width=device-width" in (viewport_val or "").lower()), "value": viewport_val},
+        "viewport_meta": {"ok": bool(viewport_val and "width=device-width" in viewport_val.lower()), "value": viewport_val},
         "h1_count": {"ok": (len(heads.get("h1", [])) == 1), "value": len(heads.get("h1", []))},
         "alt_coverage": {"ok": (alt_percent >= 80), "percent": alt_percent, "total_imgs": total_imgs},
-        "indexable": {"ok": True if indexable_ok is True else (None if indexable_ok is None else False), "value": indexable_val},
-        "title_length": {"ok": (10 <= len(title or "") <= 60), "chars": len(title or "")},
-        "meta_description_length": {"ok": (50 <= len(meta_desc or "") <= 160), "chars": len(meta_desc or "")},
+        "indexable": {"ok": _bool_badge(indexable_ok), "value": indexable_val},
+        "title_length": {"ok": (10 <= _safe_len(title) <= 60), "chars": _safe_len(title)},
+        "meta_description_length": {"ok": (50 <= _safe_len(meta_desc) <= 160), "chars": _safe_len(meta_desc)},
         "robots_meta_index": {"ok": (indexable_val != "noindex"), "value": robots_meta or ""},
         "robots_meta_follow": {"ok": ("nofollow" not in (robots_meta or "")), "value": robots_meta or ""},
         "x_robots_tag": {"ok": ("noindex" not in (x_robots or "").lower())},
         "lang": {"ok": bool(soup.find("html") and (soup.find("html").get("lang") or "").strip())},
-        "charset": {"ok": bool(re.search(r"charset=([\w\-]+)", resp.headers.get("Content-Type",""), flags=re.I))},
-        "compression": {"ok": ((resp.headers.get("Content-Encoding") or "").lower() in ["gzip", "br", "deflate"]),
-                        "value": (resp.headers.get("Content-Encoding") or "none").lower()},
+        "charset": {"ok": bool(charset)},
+        "compression": {"ok": (enc in ["gzip", "br", "deflate"]), "value": enc},
     }
 
-    # Performance summary
+    # ---- Performance summary
     perf = {
-        "final_url": final_url, "http_version": http_version, "redirects": redirects,
-        "page_size_bytes": content_len, "load_time_ms": round(elapsed_ms),
+        "final_url": final_url,
+        "http_version": http_version,
+        "redirects": redirects,
+        "page_size_bytes": content_len,
+        "load_time_ms": round(elapsed_ms),
         "https": {"is_https": is_https, "ssl_checked": False, "ssl_ok": None},
-        "mobile_score": None, "desktop_score": None,
+        "mobile_score": None,
+        "desktop_score": None,
     }
 
-    # PageSpeed (optional)
-    ps = _pagespeed(final_url, fast)
+    # ---- PageSpeed
+    if fast:
+        ps = _pagespeed_fast(final_url) if PSI_IN_FAST else {"enabled": False, "message": "Skipped (FAST_MODE_DEFAULT)"}
+    else:
+        ps = _pagespeed_full(final_url)
     if ps.get("enabled"):
         perf["mobile_score"] = ps.get("mobile", {}).get("score")
         perf["desktop_score"] = ps.get("desktop", {}).get("score")
 
-    # ---------------- (3) Update result ----------------
+    # ---- Structured data (canonical)
+    json_ld_items, json_ld_errors = _extract_jsonld(soup)
+    microdata = _extract_microdata(soup, final_url)
+    rdfa = _extract_rdfa(soup, final_url)
+
+    # AMP fallback for JSON-LD
+    if not json_ld_items and amp_url and JSONLD_FALLBACK_TO_AMP:
+        try:
+            r_amp, amp_html, _meta = fetch_html_hardened(amp_url, referer=final_url, timeout_s=12)
+            amp_soup = _soup_parse(amp_html.encode(r_amp.encoding or "utf-8", errors="ignore"), str(r_amp.url))
+            amp_items, amp_errs = _extract_jsonld(amp_soup)
+            if amp_items:
+                json_ld_items = amp_items
+                json_ld_errors.extend([f"Used AMP JSON-LD fallback ({len(amp_items)} items)"])
+            else:
+                json_ld_errors.extend(amp_errs)
+        except Exception as e:
+            json_ld_errors.append(f"AMP JSON-LD fallback failed: {e}")
+
+    # Collect types across JSON-LD, Microdata, RDFa
+    sd_type_set = set()
+    for it in json_ld_items:
+        t = it.get("@type")
+        if isinstance(t, list):
+            sd_type_set.update(map(str, t))
+        elif t:
+            sd_type_set.add(str(t))
+    for it in microdata:
+        t = it.get("@type")
+        if t:
+            sd_type_set.add(str(t))
+    for it in rdfa:
+        t = it.get("@type")
+        if t:
+            for part in str(t).split():
+                sd_type_set.add(part)
+
+    # ---- Populate result
     result.update({
         "status_code": status,
         "load_time_ms": round(elapsed_ms),
@@ -590,16 +950,27 @@ def get_pagespeed_data(target_url: str, fast: Optional[bool] = None) -> Dict[str
         "performance": perf,
         "pagespeed": ps,
         "crawl_checks": {"sitemaps": crawl.get("sitemaps", []), "blocked_by_robots": crawl.get("blocked_by_robots")},
-        "sitemap_summary": {"sitemaps_found": len(sitemap_urls), "sampled_url_count": 0, "possible_orphans_sampled": []},
+        "sitemap_summary": {
+            "sitemaps_found": len(sitemap_urls),
+            "sampled_url_count": len(sitemap_sample),
+            "possible_orphans_sampled": orphans[:50],
+        },
         "assets": assets,
         "assets_audit": assets_audit,
         "mixed_content": mixed,
         "security_headers": security,
         "json_ld": json_ld_items,
-        "json_ld_validation": json_ld_validation,
+        "json_ld_validation": {
+            "summary": {
+                "total_items": len(json_ld_items),
+                "ok_count": len(json_ld_items),
+                "has_errors": bool(json_ld_errors),
+            },
+            "items": [],
+        },
         "json_ld_errors": json_ld_errors,
-        "microdata": [],
-        "rdfa": [],
-        "sd_types": {"types": sorted(types_set)},
+        "microdata": microdata,
+        "rdfa": rdfa,
+        "sd_types": {"types": sorted(sd_type_set)},
     })
     return result
