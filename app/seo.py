@@ -111,6 +111,73 @@ def _fetch(url: str) -> Tuple[requests.Response, float]:
     )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     return resp, elapsed_ms
+def _extract_microdata_rdfa(html_text: str, base_url: str) -> tuple[list[dict], list[dict], str | None]:
+    try:
+        import extruct
+        from w3lib.html import get_base_url
+    except Exception:
+        return [], [], "Install extruct+w3lib to enable Microdata/RDFa parsing"
+
+    try:
+        data = extruct.extract(
+            html_text, base_url=get_base_url(html_text, base_url),
+            syntaxes=["microdata", "rdfa"], uniform=True
+        )
+        return data.get("microdata", []) or [], data.get("rdfa", []) or [], None
+    except Exception as e:
+        return [], [], f"Microdata/RDFa parse error: {e}"
+
+def _extract_json_ld(soup: BeautifulSoup) -> tuple[list[dict], dict, list[str]]:
+    """Extract JSON-LD items, flatten arrays and @graph, and return (items, sd_types, errors)."""
+    items: list[dict] = []
+    errors: list[str] = []
+
+    def _flatten(node):
+        if isinstance(node, list):
+            for x in node:
+                yield from _flatten(x)
+        elif isinstance(node, dict):
+            g = node.get("@graph")
+            if isinstance(g, list):
+                for x in g:
+                    yield from _flatten(x)
+            else:
+                yield node
+
+    for tag in soup.find_all(
+        "script", type=lambda v: isinstance(v, str) and v.lower().startswith("application/ld+json")
+    ):
+        raw = (tag.string or tag.text or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # try unescaped in case it was HTML-escaped
+            try:
+                data = json.loads(html.unescape(raw))
+            except Exception as e:
+                errors.append(f"JSON-LD parse error: {e}")
+                continue
+
+        for obj in _flatten(data):
+            if isinstance(obj, dict):
+                items.append(obj)
+
+    # normalize @type (can be str or list)
+    type_set: set[str] = set()
+    for obj in items:
+        t = obj.get("@type")
+        if isinstance(t, list):
+            for tt in t:
+                if isinstance(tt, str):
+                    type_set.add(tt)
+        elif isinstance(t, str):
+            type_set.add(t)
+
+    sd_types = {"types": sorted(type_set)}
+    return items, sd_types, errors
+
 
 def _get_text_density(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     for tag in soup(["script", "style", "noscript", "template"]):
@@ -680,54 +747,63 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         perf["mobile_score"] = ps.get("mobile", {}).get("score")
         perf["desktop_score"] = ps.get("desktop", {}).get("score")
 
-    # --- JSON-LD quick scan ---
-    json_ld = []
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            json_ld.append(json.loads(tag.string or "{}"))
-        except Exception:
-            continue
+# --- Structured Data ---
+json_ld_items, sd_types, sd_errs = _extract_json_ld(soup)
+
+# Microdata/RDFa (optional)
+microdata, rdfa, mf_note = _extract_microdata_rdfa(html_text, final_url)
+
+if sd_errs:
+    result["errors"].extend(sd_errs)
+if mf_note:
+    result.setdefault("notes", {}).setdefault("structured_data", mf_note)
+
 
     result.update({
-        "status_code": status,
-        "load_time_ms": round(elapsed_ms),
-        "content_length": content_len,
-        "title": title,
-        "description": meta_desc,
-        "canonical": canonical,
-        "robots_meta": robots_meta,
-        "robots_url": crawl.get("robots_url"),
-        "is_amp": is_amp,
-        "amp_url": amp_url,
-        "has_open_graph": has_og,
-        "has_twitter_card": has_twitter,
-        "open_graph": og,
-        "twitter_card": tw,
-        "h1": heads["h1"], "h2": heads["h2"], "h3": heads["h3"], "h4": heads["h4"], "h5": heads["h5"], "h6": heads["h6"],
-        "keyword_density_top": kd,
-        "hreflang": hreflang_list,
-        "hreflang_validation": hreflang_check,
-        "images_missing_alt": imgs_missing,
-        "internal_links": internal,
-        "external_links": external,
-        "nofollow_links": nofollow,
-        "link_checks": link_checks,
-        "checks": checks,
-        "performance": perf,
-        "pagespeed": ps,
-        "crawl_checks": {"sitemaps": crawl.get("sitemaps", []), "blocked_by_robots": crawl.get("blocked_by_robots")},
-        "sitemap_summary": {
-            "sitemaps_found": len(sitemap_urls),
-            "sampled_url_count": len(sitemap_sample),
-            "possible_orphans_sampled": orphans[:50],
-        },
-        "assets": assets,
-        "assets_audit": assets_audit,
-        "mixed_content": mixed,
-        "security_headers": security,
-        "json_ld": json_ld,
-        "microdata": [],
-        "rdfa": [],
-        "sd_types": {"types": list({item.get("@type") for item in json_ld if isinstance(item, dict) and item.get("@type")}) if json_ld else []},
-    })
-    return result
+    "status_code": status,
+    "load_time_ms": round(elapsed_ms),
+    "content_length": content_len,
+    "title": title,
+    "description": meta_desc,
+    "canonical": canonical,
+    "robots_meta": robots_meta,
+    "robots_url": crawl.get("robots_url"),
+    "is_amp": is_amp,
+    "amp_url": amp_url,
+    "has_open_graph": has_og,
+    "has_twitter_card": has_twitter,
+    "open_graph": og,
+    "twitter_card": tw,
+    "h1": heads["h1"], "h2": heads["h2"], "h3": heads["h3"], "h4": heads["h4"], "h5": heads["h5"], "h6": heads["h6"],
+    "keyword_density_top": kd,
+    "hreflang": hreflang_list,
+    "hreflang_validation": hreflang_check,
+    "images_missing_alt": imgs_missing,
+    "internal_links": internal,
+    "external_links": external,
+    "nofollow_links": nofollow,
+    "link_checks": link_checks,
+    "checks": checks,
+    "performance": perf,
+    "pagespeed": ps,
+    "crawl_checks": {
+        "sitemaps": crawl.get("sitemaps", []),
+        "blocked_by_robots": crawl.get("blocked_by_robots")
+    },
+    "sitemap_summary": {
+        "sitemaps_found": len(sitemap_urls),
+        "sampled_url_count": len(sitemap_sample),
+        "possible_orphans_sampled": orphans[:50],
+    },
+    "assets": assets,
+    "assets_audit": assets_audit,
+    "mixed_content": mixed,
+    "security_headers": security,
+
+    # ✅ Structured Data (use the variables you just extracted)
+    "json_ld": json_ld_items,
+    "microdata": microdata,
+    "rdfa": rdfa,
+    "sd_types": sd_types,   # <-- don't rebuild from an old json_ld var
+})
+return result
