@@ -573,7 +573,11 @@ def _pagespeed_fast(url: str) -> Dict[str, Any]:
 
 # ---------- Public entry ----------
 def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, Any]:
-    fast = FAST_MODE_DEFAULT if fast is None else fast
+    """
+    Main analyzer. Returns a dict consumed by templates/index.html.
+    fast=True runs a lighter scan (no PSI unless PSI_IN_FAST=1, smaller samples).
+    """
+    fast = FAST_MODE_DEFAULT if fast is None else bool(fast)
     url = _normalize_url(target_url)
 
     result: Dict[str, Any] = {
@@ -614,12 +618,28 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "microdata": [],
         "rdfa": [],
         "sd_types": {"types": []},
+        "errors": [],
+        "notes": {},
     }
 
-    # --- Fetch page ---
+    # --- Fetch page (hardened to bypass common WAF/bot blocks) ---
     try:
-        resp, elapsed_ms = _fetch(url)
+        t0 = time.perf_counter()
+        # allow env override if you added FETCH_HARDENED_TIMEOUT
+        timeout_s = int(os.getenv("FETCH_HARDENED_TIMEOUT", "25"))
+        resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/", timeout_s=timeout_s)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        final_url = str(resp.url)
+        body_bytes = html_text.encode(resp.encoding or "utf-8", errors="ignore")
+        content_len = len(body_bytes)
+        soup = _soup_parse(body_bytes, final_url)
+
+        result["notes"] = {"fetch": fetch_meta}
+        if "warning" in fetch_meta:
+            result.setdefault("errors", []).append(fetch_meta["warning"])
     except Exception as e:
+        # return a shaped result so UI renders nicely even on fetch failures
         result["performance"] = {
             "final_url": url,
             "http_version": "HTTP/1.1",
@@ -631,18 +651,19 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
             "desktop_score": None,
         }
         result["pagespeed"] = {"enabled": False, "message": f"Fetch failed: {e}"}
+        result.setdefault("errors", []).append(f"Fetch failed: {e}")
         return result
 
-    final_url = resp.url
+    # --- Basics from response / DOM ---
     status = resp.status_code
-    body = resp.content or b""
-    content_len = len(body)
-    soup = _soup_parse(body, final_url)
+    final_url = str(resp.url)
+    soup = soup  # already built
+    content_len = len(body_bytes)
 
-    # --- Security headers (from main response) ---
+    # Security headers
     security = _audit_security_headers(resp.headers)
 
-    # --- Meta basics ---
+    # Meta basics
     title = (soup.title.string.strip() if (soup.title and soup.title.string) else None)
     m_desc = soup.find("meta", attrs={"name": "description"})
     meta_desc = m_desc.get("content").strip() if m_desc and m_desc.get("content") else None
@@ -652,7 +673,6 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     viewport_val = (viewport.get("content") or "").strip() if viewport else None
     canonical_tag = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
     canonical = urljoin(final_url, canonical_tag["href"]) if canonical_tag and canonical_tag.get("href") else None
-
     x_robots = resp.headers.get("X-Robots-Tag")
     enc = (resp.headers.get("Content-Encoding") or "").lower() or "none"
     charset = None
@@ -660,23 +680,22 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     m = re.search(r"charset=([\w\-]+)", ctype, flags=re.I)
     if m:
         charset = m.group(1)
-
     redirects = len(resp.history)
     http_version = "HTTP/1.1"
     is_https = final_url.startswith("https")
 
-    # --- OG / Twitter ---
+    # Social meta
     og, tw = _collect_metas(soup)
     has_og = bool(og)
     has_twitter = bool(tw)
 
-    # --- AMP ---
+    # AMP
     is_amp, amp_url = _detect_amp(soup, final_url)
 
-    # --- Headings ---
+    # Headings
     heads = {lvl: [h.get_text(strip=True) for h in soup.find_all(lvl)] for lvl in ["h1","h2","h3","h4","h5","h6"]}
 
-    # --- Links & images ---
+    # Links & images
     internal, external, nofollow = _extract_links(soup, final_url)
     images = soup.find_all("img")
     imgs_missing = [{"src": urljoin(final_url, (im.get("src") or ""))} for im in images if not (im.get("alt") or "").strip()]
@@ -684,40 +703,43 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     miss_count = len(imgs_missing)
     alt_percent = round(100.0 * (total_imgs - miss_count) / total_imgs, 2) if total_imgs else 100.0
 
-    # --- Keyword density ---
+    # Keyword density
     kd = _get_text_density(soup)
 
-    # --- robots & sitemaps ---
+    # robots.txt & sitemaps
     crawl = _robots_and_sitemaps(final_url)
     sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
-    sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
-    # quick orphan candidates = present in sitemap but not linked on this page
+    if fast:
+        sitemap_sample = []
+    else:
+        sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
     orphans = [u for u in sitemap_sample if u not in set(internal)]
 
-    # --- Link status (concurrent & sampled) ---
+    # Link status (sampled)
     link_checks = _sample_status(internal, external, fast=fast)
 
-    # --- Assets & audits ---
-    assets = _extract_assets(soup, final_url, max_per_type=ASSET_SAMPLE_PER_TYPE)
+    # Assets & audits (smaller sample in fast mode)
+    max_assets = ASSET_SAMPLE_PER_TYPE // 2 if fast else ASSET_SAMPLE_PER_TYPE
+    assets = _extract_assets(soup, final_url, max_per_type=max_assets)
     asset_rows = _head_many(assets["css"] + assets["js"] + assets["img"])
     assets_audit = _audit_assets(asset_rows)
     mixed = _mixed_content(assets, final_url)
 
-    # --- Hreflang validation ---
+    # Hreflang validation
     base_host = urlparse(final_url).netloc.lower()
     hreflang_list = _hreflang_links(soup, final_url)
     hreflang_check = _validate_hreflang(hreflang_list, base_host)
 
-    # --- Indexability / checks ---
+    # Indexability / checks
     indexable_ok, indexable_val = _check_indexability(robots_meta, x_robots)
     checks = {
         "canonical": {"ok": bool(canonical), "value": canonical},
         "viewport_meta": {"ok": bool(viewport_val and "width=device-width" in viewport_val.lower()), "value": viewport_val},
         "h1_count": {"ok": (len(heads.get("h1", [])) == 1), "value": len(heads.get("h1", []))},
         "alt_coverage": {"ok": (alt_percent >= 80), "percent": alt_percent, "total_imgs": total_imgs},
-        "indexable": {"ok": _bool_badge(indexable_ok), "value": indexable_val},
-        "title_length": {"ok": (10 <= _safe_len(title) <= 60), "chars": _safe_len(title)},
-        "meta_description_length": {"ok": (50 <= _safe_len(meta_desc) <= 160), "chars": _safe_len(meta_desc)},
+        "indexable": {"ok": True if indexable_ok is True else (None if indexable_ok is None else False), "value": indexable_val},
+        "title_length": {"ok": (10 <= len(title or "") <= 60), "chars": len(title or "")},
+        "meta_description_length": {"ok": (50 <= len(meta_desc or "") <= 160), "chars": len(meta_desc or "")},
         "robots_meta_index": {"ok": (indexable_val != "noindex"), "value": robots_meta or ""},
         "robots_meta_follow": {"ok": ("nofollow" not in (robots_meta or "")), "value": robots_meta or ""},
         "x_robots_tag": {"ok": ("noindex" not in (x_robots or "").lower())},
@@ -726,7 +748,7 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "compression": {"ok": (enc in ["gzip", "br", "deflate"]), "value": enc},
     }
 
-    # --- Performance summary ---
+    # Performance summary
     perf = {
         "final_url": final_url,
         "http_version": http_version,
@@ -738,72 +760,76 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
         "desktop_score": None,
     }
 
-    # --- PageSpeed (with CrUX) ---
+    # PageSpeed (with CrUX)
     if fast:
-        ps = _pagespeed_fast(final_url) if PSI_IN_FAST else {"enabled": False, "message": "Skipped (FAST_MODE_DEFAULT)"}
+        ps = _pagespeed_fast(final_url) if PSI_IN_FAST else {"enabled": False, "message": "Skipped in fast mode"}
     else:
         ps = _pagespeed_full(final_url)
     if ps.get("enabled"):
         perf["mobile_score"] = ps.get("mobile", {}).get("score")
         perf["desktop_score"] = ps.get("desktop", {}).get("score")
 
-# --- Structured Data ---
-json_ld_items, sd_types, sd_errs = _extract_json_ld(soup)
+    # Structured Data
+    try:
+        json_ld_items, sd_types, sd_errs = _extract_json_ld(soup)
+    except Exception:
+        json_ld_items, sd_types, sd_errs = [], {"types": []}, []
+        # fallback simple parser
+        for tag in soup.find_all("script", type=lambda v: isinstance(v, str) and v.lower().startswith("application/ld+json")):
+            try:
+                json_ld_items.append(json.loads(tag.string or tag.text or "{}"))
+            except Exception:
+                pass
+    try:
+        microdata, rdfa, mf_note = _extract_microdata_rdfa(html_text, final_url)
+    except Exception:
+        microdata, rdfa, mf_note = [], [], "Install extruct+w3lib to enable Microdata/RDFa parsing"
+    if sd_errs:
+        result.setdefault("errors", []).extend(sd_errs)
+    if mf_note:
+        result.setdefault("notes", {}).setdefault("structured_data", mf_note)
 
-# Microdata/RDFa (optional)
-microdata, rdfa, mf_note = _extract_microdata_rdfa(html_text, final_url)
-
-if sd_errs:
-    result["errors"].extend(sd_errs)
-if mf_note:
-    result.setdefault("notes", {}).setdefault("structured_data", mf_note)
-
-
+    # Final aggregation
     result.update({
-    "status_code": status,
-    "load_time_ms": round(elapsed_ms),
-    "content_length": content_len,
-    "title": title,
-    "description": meta_desc,
-    "canonical": canonical,
-    "robots_meta": robots_meta,
-    "robots_url": crawl.get("robots_url"),
-    "is_amp": is_amp,
-    "amp_url": amp_url,
-    "has_open_graph": has_og,
-    "has_twitter_card": has_twitter,
-    "open_graph": og,
-    "twitter_card": tw,
-    "h1": heads["h1"], "h2": heads["h2"], "h3": heads["h3"], "h4": heads["h4"], "h5": heads["h5"], "h6": heads["h6"],
-    "keyword_density_top": kd,
-    "hreflang": hreflang_list,
-    "hreflang_validation": hreflang_check,
-    "images_missing_alt": imgs_missing,
-    "internal_links": internal,
-    "external_links": external,
-    "nofollow_links": nofollow,
-    "link_checks": link_checks,
-    "checks": checks,
-    "performance": perf,
-    "pagespeed": ps,
-    "crawl_checks": {
-        "sitemaps": crawl.get("sitemaps", []),
-        "blocked_by_robots": crawl.get("blocked_by_robots")
-    },
-    "sitemap_summary": {
-        "sitemaps_found": len(sitemap_urls),
-        "sampled_url_count": len(sitemap_sample),
-        "possible_orphans_sampled": orphans[:50],
-    },
-    "assets": assets,
-    "assets_audit": assets_audit,
-    "mixed_content": mixed,
-    "security_headers": security,
-
-    # ✅ Structured Data (use the variables you just extracted)
-    "json_ld": json_ld_items,
-    "microdata": microdata,
-    "rdfa": rdfa,
-    "sd_types": sd_types,   # <-- don't rebuild from an old json_ld var
-})
-return result
+        "status_code": status,
+        "load_time_ms": round(elapsed_ms),
+        "content_length": content_len,
+        "title": title,
+        "description": meta_desc,
+        "canonical": canonical,
+        "robots_meta": robots_meta,
+        "robots_url": crawl.get("robots_url"),
+        "is_amp": is_amp,
+        "amp_url": amp_url,
+        "has_open_graph": has_og,
+        "has_twitter_card": has_twitter,
+        "open_graph": og,
+        "twitter_card": tw,
+        "h1": heads["h1"], "h2": heads["h2"], "h3": heads["h3"], "h4": heads["h4"], "h5": heads["h5"], "h6": heads["h6"],
+        "keyword_density_top": kd,
+        "hreflang": hreflang_list,
+        "hreflang_validation": hreflang_check,
+        "images_missing_alt": imgs_missing,
+        "internal_links": internal,
+        "external_links": external,
+        "nofollow_links": nofollow,
+        "link_checks": link_checks,
+        "checks": checks,
+        "performance": perf,
+        "pagespeed": ps,
+        "crawl_checks": {"sitemaps": crawl.get("sitemaps", []), "blocked_by_robots": crawl.get("blocked_by_robots")},
+        "sitemap_summary": {
+            "sitemaps_found": len(sitemap_urls),
+            "sampled_url_count": len(sitemap_sample),
+            "possible_orphans_sampled": orphans[:50],
+        },
+        "assets": assets,
+        "assets_audit": assets_audit,
+        "mixed_content": mixed,
+        "security_headers": security,
+        "json_ld": json_ld_items,
+        "microdata": microdata,
+        "rdfa": rdfa,
+        "sd_types": sd_types,
+    })
+    return result
