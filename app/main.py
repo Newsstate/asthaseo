@@ -14,24 +14,23 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+# Basic logging so we see import/scan errors in Render logs
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("app.main")
 
 # ---------- Paths & App ----------
 FILE_DIR = Path(__file__).parent          # /app
 PROJECT_ROOT = FILE_DIR.parent            # repo root
 
-app = FastAPI(title="SEO & Performance Dashboard", version="1.1.0")
-logger = logging.getLogger("uvicorn.error")
-
+app = FastAPI(title="SEO & Performance Dashboard", version="1.2.0")
 
 # ---------- Static ----------
 STATIC_DIR = PROJECT_ROOT / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)  # avoid mount errors if missing
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-
 # ---------- Templates ----------
 templates = Jinja2Templates(directory=str(FILE_DIR / "templates"))
-
 
 # ---------- Database (optional) ----------
 init_db = None
@@ -39,7 +38,6 @@ try:
     from .db import init_db  # type: ignore
 except Exception as e:
     logger.warning("DB module not found or failed to import: %r", e)
-
 
 @app.on_event("startup")
 async def on_startup():
@@ -59,19 +57,25 @@ async def on_startup():
     if not os.getenv("PAGESPEED_API_KEY"):
         logger.warning("PAGESPEED_API_KEY not set; PageSpeed features may be disabled")
 
-
 # ---------- Import analyzer (sync function) ----------
 def _fallback_pagespeed(url: str, fast: Optional[bool] = None) -> dict:
     # Safe placeholder if seo.py fails to import; keep signature compatible
-    return {"ok": False, "message": "seo.get_pagespeed_data not found", "url": url, "fast": fast}
+    return {
+        "ok": False,
+        "message": "seo.get_pagespeed_data not found (using fallback)",
+        "url": url,
+        "fast": fast,
+        "errors": ["Analyzer not loaded: check seo.py import errors in logs"],
+        "pagespeed": {"enabled": False},
+    }
 
 get_pagespeed_data = _fallback_pagespeed
 try:
     from .seo import get_pagespeed_data as _real_get_pagespeed_data  # type: ignore
     get_pagespeed_data = _real_get_pagespeed_data
+    logger.info("seo.get_pagespeed_data loaded successfully")
 except Exception as e:
-    logger.warning("seo.get_pagespeed_data unavailable, using fallback: %r", e)
-
+    logger.error("seo.get_pagespeed_data unavailable, using fallback: %r", e)
 
 # ---------- Helpers ----------
 def _normalize_url(u: str) -> str:
@@ -83,15 +87,12 @@ def _normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-
 # ---------- Routes ----------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    # Render the main dashboard with empty result
     return templates.TemplateResponse("index.html", {"request": request, "result": None, "scan_mode": "auto"})
 
-
-# Accepts HTML form posts (action points here)
+# POST form analyzer (preferred by your UI)
 @app.post("/analyze", name="analyze_form", response_class=HTMLResponse)
 @app.post("/analyze/", response_class=HTMLResponse)
 async def analyze_form(
@@ -110,14 +111,13 @@ async def analyze_form(
     try:
         data = await run_in_threadpool(get_pagespeed_data, target, fast_bool)
     except Exception as e:
-        # Render page with an inline error payload so UI stays usable
+        logger.exception("Analyze failed")
         data = {"url": target, "errors": [str(e)], "pagespeed": {"enabled": False, "message": str(e)}}
 
     mode_label = "fast" if fast_bool is True else ("deep" if fast_bool is False else "auto")
     return templates.TemplateResponse("index.html", {"request": request, "result": data, "scan_mode": mode_label})
 
-
-# Optional: GET /analyze?url=...&fast=1
+# Optional GET analyzer: /analyze?url=...&fast=1
 @app.get("/analyze", response_class=HTMLResponse)
 @app.get("/analyze/", response_class=HTMLResponse)
 async def analyze_get(
@@ -134,13 +134,13 @@ async def analyze_get(
     try:
         data = await run_in_threadpool(get_pagespeed_data, target, fast_bool)
     except Exception as e:
+        logger.exception("Analyze (GET) failed")
         data = {"url": target, "errors": [str(e)], "pagespeed": {"enabled": False, "message": str(e)}}
 
     mode_label = "fast" if fast_bool is True else ("deep" if fast_bool is False else "auto")
     return templates.TemplateResponse("index.html", {"request": request, "result": data, "scan_mode": mode_label})
 
-
-# Handle common typo '/analyz' (no 'e')
+# Typo handler
 @app.get("/analyz")
 @app.get("/analyz/")
 async def analyz_get_redirect():
@@ -159,8 +159,7 @@ async def analyz_post_redirect(url: Optional[str] = Form(None)):
     </body></html>"""
     return HTMLResponse(html)
 
-
-# JSON API variant
+# JSON API
 class AnalyzeRequest(BaseModel):
     url: str
     fast: Optional[bool] = None
@@ -173,14 +172,9 @@ async def analyze_api(payload: AnalyzeRequest):
     data = await run_in_threadpool(get_pagespeed_data, target, payload.fast)
     return {"url": target, "result": data, "fast": payload.fast}
 
-
-# --- AMP vs Non-AMP compare page (renders app/templates/amp_compare.html) ---
+# AMP vs Non-AMP compare (renders templates/amp_compare.html)
 @app.get("/amp-compare", response_class=HTMLResponse, name="amp_compare")
 async def amp_compare(request: Request, url: str = Query(..., description="Canonical or AMP URL to compare")):
-    """
-    Compare key SEO/performance/meta items between a canonical URL and its AMP variant.
-    Uses 'fast' mode for responsiveness.
-    """
     def fmt(v):
         if v is None:
             return "—"
@@ -196,7 +190,6 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
             cur = cur.get(k)
         return cur if cur is not None else default
 
-    # Fetch the initial URL (FAST)
     try:
         a = await run_in_threadpool(get_pagespeed_data, _normalize_url(url), True)
     except Exception as e:
@@ -207,9 +200,7 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
 
     non_amp_url = _normalize_url(url)
     amp_url = a.get("amp_url")
-
     if a.get("is_amp"):
-        # If input is already AMP, use canonical as non-AMP
         non_amp_url = a.get("canonical") or non_amp_url
         amp_url = non_amp_url if non_amp_url == url else url
 
@@ -219,7 +210,6 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
             {"request": request, "url": non_amp_url, "amp_url": None, "rows": [], "error": "No AMP version found (no <link rel=\"amphtml\">)."}
         )
 
-    # Fetch AMP page (FAST)
     try:
         b = await run_in_threadpool(get_pagespeed_data, _normalize_url(amp_url), True)
     except Exception as e:
@@ -228,7 +218,6 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
             {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": [], "error": f"AMP fetch failed: {e}"}
         )
 
-    # Build comparison rows
     rows = []
     def add_row(label, val_a, val_b):
         sa, sb = fmt(val_a), fmt(val_b)
@@ -240,40 +229,37 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
     add_row("Canonical", a.get("canonical"), b.get("canonical"))
     add_row("Robots Meta", a.get("robots_meta"), b.get("robots_meta"))
     add_row("H1", sget(a, "h1", default=[]), sget(b, "h1", default=[]))
-
-    # Performance
-    add_row("Load Time (ms)",
-            sget(a, "performance", "load_time_ms", default=a.get("load_time_ms")),
-            sget(b, "performance", "load_time_ms", default=b.get("load_time_ms")))
-    add_row("Page Size (bytes)",
-            sget(a, "performance", "page_size_bytes", default=a.get("content_length")),
-            sget(b, "performance", "page_size_bytes", default=b.get("content_length")))
-    add_row("PSI Mobile Score",
-            sget(a, "performance", "mobile_score"),
-            sget(b, "performance", "mobile_score"))
-    add_row("PSI Desktop Score",
-            sget(a, "performance", "desktop_score"),
-            sget(b, "performance", "desktop_score"))
-
-    # Social meta
-    add_row("OG Image",
-            sget(a, "open_graph", "og:image"),
-            sget(b, "open_graph", "og:image"))
-    add_row("Twitter Card",
-            sget(a, "twitter_card", "twitter:card"),
-            sget(b, "twitter_card", "twitter:card"))
-
-    # Indexability
-    add_row("Indexable",
-            sget(a, "checks", "indexable", "value"),
-            sget(b, "checks", "indexable", "value"))
+    add_row("Load Time (ms)", sget(a, "performance", "load_time_ms", default=a.get("load_time_ms")),
+                          sget(b, "performance", "load_time_ms", default=b.get("load_time_ms")))
+    add_row("Page Size (bytes)", sget(a, "performance", "page_size_bytes", default=a.get("content_length")),
+                              sget(b, "performance", "page_size_bytes", default=b.get("content_length")))
+    add_row("PSI Mobile Score", sget(a, "performance", "mobile_score"), sget(b, "performance", "mobile_score"))
+    add_row("PSI Desktop Score", sget(a, "performance", "desktop_score"), sget(b, "performance", "desktop_score"))
+    add_row("OG Image", sget(a, "open_graph", "og:image"), sget(b, "open_graph", "og:image"))
+    add_row("Twitter Card", sget(a, "twitter_card", "twitter:card"), sget(b, "twitter_card", "twitter:card"))
+    add_row("Indexable", sget(a, "checks", "indexable", "value"), sget(b, "checks", "indexable", "value"))
 
     return templates.TemplateResponse(
         "amp_compare.html",
         {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": rows, "error": None}
     )
 
-
+# Health & diagnostics
 @app.get("/healthz", response_class=JSONResponse)
 async def healthz():
-    return {"status": "ok"}
+    ok = get_pagespeed_data is not _fallback_pagespeed
+    return {"status": "ok", "seo_imported": ok}
+
+@app.get("/_diag", response_class=JSONResponse)
+async def diag():
+    """Quick tip: open /_diag to confirm seo.py actually loaded."""
+    ok = get_pagespeed_data is not _fallback_pagespeed
+    return {"seo_imported": ok}
+
+@app.get("/_debug/analyze", response_class=JSONResponse)
+async def debug_analyze(url: str = Query(...), fast: Optional[int] = Query(None)):
+    """Bypass templates and see raw JSON from the analyzer."""
+    target = _normalize_url(url)
+    fast_bool = None if fast is None else (fast == 1)
+    data = await run_in_threadpool(get_pagespeed_data, target, fast_bool)
+    return {"url": target, "fast": fast_bool, "result": data}
