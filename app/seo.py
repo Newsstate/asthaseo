@@ -17,6 +17,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+from urllib import robotparser
 
 # =========================
 # Tunables via ENV
@@ -144,9 +145,8 @@ def _looks_like_antibot(resp: requests.Response) -> bool:
 
 
 def fetch_html_hardened(url: str, referer: str | None = None, timeout_s: int = 25):
-    """(response, html, meta) – try 3 different header profiles."""
-    sess = requests.Session()
-    sess.trust_env = False
+    """(response, html, meta) – try 3 different header profiles, reuse pooled session."""
+    sess = _get_session()
     tries = []
     for hdr in (_BASE_HEADERS, _ALT_HEADERS, _MOBILE_HEADERS):
         h = dict(hdr)
@@ -158,7 +158,12 @@ def fetch_html_hardened(url: str, referer: str | None = None, timeout_s: int = 2
     last_resp = None
     for i, hdrs in enumerate(tries, 1):
         try:
-            r = sess.get(url, headers=hdrs, allow_redirects=True, timeout=(10, timeout_s))
+            r = sess.get(
+                url,
+                headers=hdrs,
+                allow_redirects=True,
+                timeout=(HTTP_CONNECT_TIMEOUT, timeout_s),
+            )
             last_resp = r
             if not _looks_like_antibot(r):
                 return r, (r.text or ""), {"ua": hdrs["User-Agent"], "attempt": i, "final_url": str(r.url)}
@@ -351,8 +356,6 @@ def _sample_status(internal: List[str], external: List[str], fast: bool) -> Dict
     return {"internal": rows_int, "external": rows_ext}
 
 
-from urllib import robotparser
-
 def _robots_and_sitemaps(base: str, target_url: str, ua: str = USER_AGENT) -> Dict[str, Any]:
     """
     Fetch robots.txt once using our session + UA, parse it locally, and check whether
@@ -377,10 +380,8 @@ def _robots_and_sitemaps(base: str, target_url: str, ua: str = USER_AGENT) -> Di
                     except Exception as e:
                         sitemaps.append({"url": sm_url, "error": str(e)})
         else:
-            # No robots or not readable; standard practice: treat as not blocked
             robots_txt = None
     except Exception as e:
-        # Network issues: treat as not blocked but surface the error
         return {
             "robots_url": robots_url,
             "sitemaps": sitemaps or [{"url": None, "error": f"robots fetch failed: {e}"}],
@@ -409,7 +410,6 @@ def _robots_and_sitemaps(base: str, target_url: str, ua: str = USER_AGENT) -> Di
         "blocked_by_robots": blocked,
         "robots_eval": details,
     }
-
 
 
 def _fetch_xml(url: str) -> str | None:
@@ -610,7 +610,8 @@ def _flatten_jsonld(obj) -> List[dict]:
 
 def _extract_jsonld(soup: BeautifulSoup) -> Tuple[List[dict], List[str]]:
     items, errs = [], []
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+    # match any type value containing "ld+json" (handles charset variations)
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
         raw = tag.get_text() or ""
         data = _relaxed_json_loads(raw)
         if data is None:
@@ -686,7 +687,6 @@ def _psi_call(url: str, strategy: str, timeout_sec: int) -> Dict[str, Any]:
         "Time To Interactive (ms)": metr("interactive"),
     }
 
-    # minimal field data (if present)
     def _crux(src: dict | None) -> dict:
         if not isinstance(src, dict):
             return {}
@@ -803,7 +803,7 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
     # ---- Fetch (hardened)
     try:
         t0 = time.perf_counter()
-        resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/")
+        resp, html_text, fetch_meta = fetch_html_hardened(url, referer="https://www.google.com/", timeout_s=int(HTTP_TIMEOUT_MAIN))
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         final_url = str(resp.url)
         body_bytes = html_text.encode(resp.encoding or "utf-8", errors="ignore")
@@ -871,25 +871,28 @@ def get_pagespeed_data(target_url: str, fast: bool | None = None) -> Dict[str, A
 
     kd = _get_text_density(soup)
 
-   # --- robots & sitemaps (UA-aware) ---
-ua_for_robots = (fetch_meta or {}).get("ua", USER_AGENT)
-crawl = _robots_and_sitemaps(final_url, final_url, ua=ua_for_robots)
-sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
-sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
-orphans = [u for u in sitemap_sample if u not in set(internal)]
+    # --- robots & sitemaps (UA-aware) ---
+    ua_for_robots = (fetch_meta or {}).get("ua", USER_AGENT)
+    crawl = _robots_and_sitemaps(final_url, final_url, ua=ua_for_robots)
+    sitemap_urls = [sm.get("url") for sm in crawl.get("sitemaps", []) if sm.get("url")]
+    sitemap_sample = _collect_sitemap_sample(sitemap_urls, cap=300)
+    orphans = [u for u in sitemap_sample if u not in set(internal)]
 
-
+    # ---- Link checks (HEAD samples)
     link_checks = _sample_status(internal, external, fast=fast)
 
+    # ---- Assets
     assets = _extract_assets(soup, final_url, max_per_type=ASSET_SAMPLE_PER_TYPE)
     asset_rows = _head_many(assets["css"] + assets["js"] + assets["img"])
     assets_audit = _audit_assets(asset_rows)
     mixed = _mixed_content(assets, final_url)
 
+    # ---- Hreflang
     base_host = urlparse(final_url).netloc.lower()
     hreflang_list = _hreflang_links(soup, final_url)
     hreflang_check = _validate_hreflang(hreflang_list, base_host)
 
+    # ---- Checks
     indexable_ok, indexable_val = _check_indexability(robots_meta, x_robots)
     checks = {
         "canonical": {"ok": bool(canonical), "value": canonical},
@@ -993,13 +996,18 @@ orphans = [u for u in sitemap_sample if u not in set(internal)]
         "checks": checks,
         "performance": perf,
         "pagespeed": ps,
-      "crawl_checks": {
-        "sitemaps": crawl.get("sitemaps", []),
-        "blocked_by_robots": crawl.get("blocked_by_robots"),
-        "robots_url": crawl.get("robots_url"),
-        "robots_ua": crawl.get("robots_eval", {}).get("ua_checked"),
-        "robots_eval": crawl.get("robots_eval", {}),
-    },
+        "crawl_checks": {
+            "sitemaps": crawl.get("sitemaps", []),
+            "blocked_by_robots": crawl.get("blocked_by_robots"),
+            "robots_url": crawl.get("robots_url"),
+            "robots_ua": crawl.get("robots_eval", {}).get("ua_checked"),
+            "robots_eval": crawl.get("robots_eval", {}),
+        },
+        "sitemap_summary": {
+            "sitemaps_found": len(sitemap_urls),
+            "sampled_url_count": len(sitemap_sample),
+            "possible_orphans_sampled": orphans[:50],
+        },
         "assets": assets,
         "assets_audit": assets_audit,
         "mixed_content": mixed,
