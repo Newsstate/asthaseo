@@ -13,6 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from fastapi import FastAPI, Request, Form, HTTPException, Query
+
 
 # Basic logging so we see import/scan errors in Render logs
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -172,9 +174,9 @@ async def analyze_api(payload: AnalyzeRequest):
     data = await run_in_threadpool(get_pagespeed_data, target, payload.fast)
     return {"url": target, "result": data, "fast": payload.fast}
 
-# AMP vs Non-AMP compare (renders templates/amp_compare.html)
+# --- AMP vs Non-AMP compare page (uses template if present, otherwise inline fallback) ---
 @app.get("/amp-compare", response_class=HTMLResponse, name="amp_compare")
-async def amp_compare(request: Request, url: str = Query(..., description="Canonical or AMP URL to compare")):
+async def amp_compare(request: Request, url: str = Query(...)):
     def fmt(v):
         if v is None:
             return "—"
@@ -182,42 +184,53 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
             return " | ".join([str(x) for x in v[:5]])
         return str(v)
 
-    def sget(d: Dict[str, Any], *keys: str, default=None):
-        cur: Any = d
+    def sget(d, *keys, default=None):
+        cur = d
         for k in keys:
-            if not isinstance(cur, dict):
+            if cur is None:
                 return default
-            cur = cur.get(k)
+            if isinstance(cur, dict):
+                cur = cur.get(k)
+            else:
+                return default
         return cur if cur is not None else default
 
+    # Fetch canonical (fast mode)
+    target = _normalize_url(url)
     try:
-        a = await run_in_threadpool(get_pagespeed_data, _normalize_url(url), True)
+        a = await run_in_threadpool(get_pagespeed_data, target, True)
     except Exception as e:
-        return templates.TemplateResponse(
-            "amp_compare.html",
-            {"request": request, "url": url, "amp_url": None, "rows": [], "error": f"Fetch failed: {e}"}
-        )
+        return HTMLResponse(f"<h1>AMP Compare</h1><p>Fetch failed: {html.escape(str(e))}</p>", status_code=500)
 
-    non_amp_url = _normalize_url(url)
+    # Decide roles
+    non_amp_url = target
     amp_url = a.get("amp_url")
     if a.get("is_amp"):
-        non_amp_url = a.get("canonical") or non_amp_url
-        amp_url = non_amp_url if non_amp_url == url else url
+        # If input is AMP, swap roles
+        canonical = a.get("canonical")
+        if canonical:
+            non_amp_url = canonical
+            amp_url = target
 
     if not amp_url:
-        return templates.TemplateResponse(
-            "amp_compare.html",
-            {"request": request, "url": non_amp_url, "amp_url": None, "rows": [], "error": "No AMP version found (no <link rel=\"amphtml\">)."}
-        )
+        # Render template if available, otherwise inline
+        ctx = {"request": request, "url": non_amp_url, "amp_url": None, "rows": [], "error": 'No AMP version found (no <link rel="amphtml">).'}
+        try:
+            return templates.TemplateResponse("amp_compare.html", ctx)
+        except Exception:
+            return HTMLResponse(f"<h1>AMP vs Non-AMP</h1><p>No AMP version found for <a href='{non_amp_url}' target='_blank'>{non_amp_url}</a>.</p>", status_code=200)
 
+    # Fetch AMP (fast mode)
     try:
         b = await run_in_threadpool(get_pagespeed_data, _normalize_url(amp_url), True)
     except Exception as e:
-        return templates.TemplateResponse(
-            "amp_compare.html",
-            {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": [], "error": f"AMP fetch failed: {e}"}
-        )
+        ctx = {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": [], "error": f"AMP fetch failed: {e}"}
+        try:
+            return templates.TemplateResponse("amp_compare.html", ctx)
+        except Exception:
+            return HTMLResponse(f"<h1>AMP vs Non-AMP</h1><p>AMP fetch failed: {html.escape(str(e))}</p>", status_code=200)
 
+    # Build comparison rows
     rows = []
     def add_row(label, val_a, val_b):
         sa, sb = fmt(val_a), fmt(val_b)
@@ -229,20 +242,54 @@ async def amp_compare(request: Request, url: str = Query(..., description="Canon
     add_row("Canonical", a.get("canonical"), b.get("canonical"))
     add_row("Robots Meta", a.get("robots_meta"), b.get("robots_meta"))
     add_row("H1", sget(a, "h1", default=[]), sget(b, "h1", default=[]))
-    add_row("Load Time (ms)", sget(a, "performance", "load_time_ms", default=a.get("load_time_ms")),
-                          sget(b, "performance", "load_time_ms", default=b.get("load_time_ms")))
-    add_row("Page Size (bytes)", sget(a, "performance", "page_size_bytes", default=a.get("content_length")),
-                              sget(b, "performance", "page_size_bytes", default=b.get("content_length")))
-    add_row("PSI Mobile Score", sget(a, "performance", "mobile_score"), sget(b, "performance", "mobile_score"))
-    add_row("PSI Desktop Score", sget(a, "performance", "desktop_score"), sget(b, "performance", "desktop_score"))
+
+    # Performance
+    add_row("Load Time (ms)",
+            sget(a, "performance", "load_time_ms", default=a.get("load_time_ms")),
+            sget(b, "performance", "load_time_ms", default=b.get("load_time_ms")))
+    add_row("Page Size (bytes)",
+            sget(a, "performance", "page_size_bytes", default=a.get("content_length")),
+            sget(b, "performance", "page_size_bytes", default=b.get("content_length")))
+    add_row("PSI Mobile Score",
+            sget(a, "performance", "mobile_score"),
+            sget(b, "performance", "mobile_score"))
+    add_row("PSI Desktop Score",
+            sget(a, "performance", "desktop_score"),
+            sget(b, "performance", "desktop_score"))
+
+    # Social meta
     add_row("OG Image", sget(a, "open_graph", "og:image"), sget(b, "open_graph", "og:image"))
     add_row("Twitter Card", sget(a, "twitter_card", "twitter:card"), sget(b, "twitter_card", "twitter:card"))
+
+    # Indexability
     add_row("Indexable", sget(a, "checks", "indexable", "value"), sget(b, "checks", "indexable", "value"))
 
-    return templates.TemplateResponse(
-        "amp_compare.html",
-        {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": rows, "error": None}
-    )
+    # Try to render template; if missing, inline fallback
+    ctx = {"request": request, "url": non_amp_url, "amp_url": amp_url, "rows": rows, "error": None}
+    try:
+        return templates.TemplateResponse("amp_compare.html", ctx)
+    except Exception:
+        # Minimal inline UI
+        items = "".join(
+            f"<tr><td>{html.escape(r['label'])}</td>"
+            f"<td>{html.escape(str(r['non_amp']))}</td>"
+            f"<td>{html.escape(str(r['amp']))}</td>"
+            f"<td>{'Changed' if r['changed'] else 'Same'}</td></tr>"
+            for r in rows
+        )
+        inline = f"""
+        <!doctype html><meta charset="utf-8">
+        <title>AMP vs Non-AMP</title>
+        <h1>AMP vs Non-AMP</h1>
+        <p><a href="{non_amp_url}" target="_blank">Open Non-AMP</a> |
+           <a href="{amp_url}" target="_blank">Open AMP</a></p>
+        <table border="1" cellpadding="6" cellspacing="0">
+          <tr><th>Metric</th><th>Non-AMP</th><th>AMP</th><th>Changed</th></tr>
+          {items}
+        </table>
+        """
+        return HTMLResponse(inline, status_code=200)
+
 
 # Health & diagnostics
 @app.get("/healthz", response_class=JSONResponse)
